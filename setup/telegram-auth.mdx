@@ -4,7 +4,7 @@ sidebarTitle: "Telegram Auth"
 description: "Generate a Telegram MTProto session file using the built-in QR-code auth flow, then deploy the session to your strategy directory."
 ---
 
-The crawler at the heart of `backtest-ollama-crontab` reads messages directly from public Telegram channels using the **MTProto protocol** via the `gram.js` `TelegramClient`. Unlike the Telegram Bot API, MTProto authenticates as a real Telegram user account, which means it can read any channel your account has access to — no channel administrator permission is needed. Authentication happens once via a QR code, and the resulting session is serialised to a plain text file that the application loads on every subsequent start.
+The crawler at the heart of `backtest-ollama-crontab` reads messages directly from public Telegram channels using the **MTProto protocol** via the **GramJS** (`telegram` npm package) `TelegramClient`. Unlike the Telegram Bot API, MTProto authenticates as a real Telegram user account, which means it can read any channel your account has access to — no channel administrator permission is needed. Authentication happens once via a QR code, and the resulting session is serialised to a plain text file that the application loads on every subsequent start.
 
 ---
 
@@ -45,7 +45,7 @@ The `singleshot` wrapper from `functools-kit` ensures the async initialisation r
 
 ### The `StringSession` mechanism
 
-`StringSession` is a gram.js session adapter that serialises the entire MTProto session state (server keys, auth keys, DC assignments) into a single base64-like string. Writing this string to `session.txt` and reading it back on the next run means the client never needs to re-authenticate, even across process restarts. If the string is empty (as during the initial auth flow), gram.js starts a fresh session from scratch.
+`StringSession` is a GramJS session adapter that serialises the entire MTProto session state (server keys, auth keys, DC assignments) into a single base64-like string. Writing this string to `session.txt` and reading it back on the next run means the client never needs to re-authenticate, even across process restarts. If the string is empty (as during the initial auth flow), GramJS starts a fresh session from scratch.
 
 <Note>
   If `session.txt` is missing or unreadable when `getTelegram` is called, the
@@ -105,7 +105,7 @@ Before running the auth command, make sure the following environment variables a
     ```
 
     Internally this invokes `packages/main/src/main/session.ts`, which calls
-    `client.signInUserWithQrCode(...)` from gram.js. The terminal clears and a
+    `client.signInUserWithQrCode(...)` from GramJS. The terminal clears and a
     QR code is rendered using `qrcode-terminal`.
 
     ```

@@ -66,7 +66,7 @@ declare global {
     Queued LLM processing job. Enabled automatically at startup (`ioc.signalJobService.enable()`). On each 15-minute crontab tick it fetches all `parser-items` where `visited: false`, runs the Ollama risk evaluation for each one, writes the result to `screen-items`, and marks the parser row as visited.
   </Card>
   <Card title="core.signalLogicService" icon="brain">
-    Single-row LLM invocation and field mapping. Called by `signalJobService` for each individual parser row. Invokes `runRiskOutline` and maps the returned `RiskOutlineContract` fields onto an `IScreenDto` ready for database insertion.
+    Single-row LLM invocation and field mapping. Called by `signalJobService` for each individual parser row. Invokes `json()` from `agent-swarm-kit` with `OutlineName.RiskOutline` and maps the returned `RiskOutlineContract` fields onto an `IScreenDto` ready for database insertion.
   </Card>
   <Card title="core.cryptoYodaScreenService" icon="filter">
     Channel-specific scrape-and-parse service for the CryptoYoda Telegram channel. Combines `scraperService` and `parserService` behaviour with channel-specific message format handling.

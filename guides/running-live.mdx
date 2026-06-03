@@ -1,5 +1,5 @@
 ---
-title: "Run in Live Mode with 15-Minute Telegram Polling"
+title: "Run in Live Mode with 15-Minute Telegram Polling Loop"
 sidebarTitle: "Live Mode"
 description: "Start the live trading pipeline that polls a Telegram channel every 15 minutes, filters signals with Ollama, and opens positions on follow verdicts."
 ---
@@ -29,11 +29,11 @@ Live mode keeps the pipeline running continuously. A 15-minute cron job polls th
     both stored in MongoDB. Redis backs the distributed queue and caching layer.
     Both services must be reachable before `npm start` is invoked.
   </Card>
-  <Card title="Ollama running with gpt-oss:120b" icon="robot">
+  <Card title="Ollama running with gpt-oss" icon="robot">
     The risk outline calls the Ollama HTTP API at `CC_OLLAMA_URL`
     (default `http://localhost:11434`). Pull the model if you have not already:
     ```bash
-    ollama pull gpt-oss:120b
+    ollama pull gpt-oss
     ```
   </Card>
 </CardGroup>

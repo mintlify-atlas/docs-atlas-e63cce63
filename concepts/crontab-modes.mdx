@@ -1,7 +1,7 @@
 ---
-title: "Live and Backtest Modes via Cron.register"
+title: "Live and Backtest Crontab Modes with Cron.register"
 sidebarTitle: "Cron Modes"
-description: "How backtest-ollama-crontab uses Cron.register from backtest-kit to schedule 15-minute live polling and one-shot backtest data fetches."
+description: "How backtest-ollama-crontab uses Cron.register from backtest-kit to drive 15-minute live Telegram polling and one-shot backtest data preparation."
 ---
 
 `backtest-ollama-crontab` uses the `Cron.register` API from `backtest-kit` to drive data ingestion in two distinct modes without duplicating logic. The same strategy file, `jan_2026.strategy.ts`, registers two cron handlers: one that fires once at startup for backtest data preparation, and one that polls every 15 minutes when running live. The `backtest` boolean parameter passed to each handler is the gating mechanism — each handler checks it and returns early if the mode is wrong. This keeps live and backtest code paths in the same file while guaranteeing they never execute simultaneously.

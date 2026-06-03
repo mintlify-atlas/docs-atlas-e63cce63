@@ -1,7 +1,7 @@
 ---
-title: "Signal Pipeline: Telegram Crawl to LLM Veto to Position"
+title: "Signal Pipeline: From Telegram Crawl to LLM Veto to Trade"
 sidebarTitle: "Pipeline"
-description: "Trace a trading signal from its publication in a Telegram channel through parsing, LLM risk filtering, and strategy execution."
+description: "Trace every trade from its Telegram publication through five pipeline stages: crawler, parser, Ollama risk gate, screen-items store, and strategy."
 ---
 
 Every trade in `backtest-ollama-crontab` is the result of a deterministic, five-stage assembly line that starts the moment a message lands in a public Telegram signals channel and ends only when a local Ollama model has either blessed or vetoed it. Nothing is opened until all five stages have completed. Understanding this pipeline is the fastest way to understand the entire project.

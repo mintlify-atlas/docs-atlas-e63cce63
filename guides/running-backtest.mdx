@@ -1,7 +1,7 @@
 ---
 title: "Run a Historical Backtest with the LLM Risk Filter"
 sidebarTitle: "Backtest"
-description: "Replay Telegram signals through the Ollama risk filter over a historical date range and view results in the backtest-kit UI."
+description: "Replay Telegram signals through the local Ollama LLM risk filter over a historical date range and view per-trade results in the backtest-kit UI."
 ---
 
 The backtest mode replays every Telegram signal published inside a configured date range, passes each one through the local Ollama LLM risk filter, and simulates position entries and exits against real historical OHLCV candles. Because the LLM is called with market context anchored at the signal's original publication time, there is no look-ahead bias — the verdict is identical to what a live run would have produced on that date.
@@ -29,11 +29,11 @@ Before running a backtest, make sure all of the following are in place.
     locking. Both must be reachable at their default ports before `npm start` is
     invoked.
   </Card>
-  <Card title="Ollama running with gpt-oss:120b" icon="robot">
+  <Card title="Ollama running with gpt-oss" icon="robot">
     The risk outline calls the local Ollama HTTP API at `CC_OLLAMA_URL`
     (default `http://localhost:11434`). Pull the model before your first run:
     ```bash
-    ollama pull gpt-oss:120b
+    ollama pull gpt-oss
     ```
   </Card>
 </CardGroup>
@@ -198,7 +198,7 @@ npm start -- --backtest --ui --entry ./content/jan_2026.strategy/jan_2026.strate
     ```
 
     The outline fetches 1m/15m candles at that historical timestamp, computes
-    `avgRangePct` and `momentum24hPct`, sends them to `gpt-oss:120b` via Ollama,
+    `avgRangePct` and `momentum24hPct`, sends them to `gpt-oss` via Ollama,
     and stores the structured verdict (`riskAction`, `riskSureLevel`,
     `riskConfidence`, `riskDescription`, `riskReasoning`) in the `screen-items`
     collection. Rows are marked as visited after screening.

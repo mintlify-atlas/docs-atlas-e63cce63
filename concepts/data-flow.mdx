@@ -1,7 +1,7 @@
 ---
-title: "Data Flow: parser-items to screen-items Collections"
+title: "Data Flow: parser-items to screen-items MongoDB Collections"
 sidebarTitle: "Data Flow"
-description: "How trading signals move from raw Telegram messages through two MongoDB collections and what fields are added at each stage."
+description: "How Telegram signals travel through two MongoDB collections, what fields each stage adds, and which indexes back the pipeline query patterns."
 ---
 
 Every signal in `backtest-ollama-crontab` passes through exactly two MongoDB collections on its journey from a raw Telegram message to an actionable trade. The first collection, `parser-items`, holds the structured extraction of the original message. The second, `screen-items`, holds a complete copy of that data enriched with the five LLM-generated risk fields. Each collection has a distinct set of indexes tuned for the access patterns that follow it in the pipeline. Understanding what lives where — and which service owns each write — makes it easy to debug, replay, or extend any stage.

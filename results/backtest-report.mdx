@@ -1,7 +1,7 @@
 ---
-title: "January 2026 Backtest: LLM Filter Adds +16.68pp PnL"
+title: "January 2026 Backtest: Ollama LLM Adds +16.68pp to PnL"
 sidebarTitle: "Backtest Report"
-description: "Full trade-by-trade backtest results for January 2026, comparing the baseline signal strategy against the Ollama-gated version."
+description: "Full trade-by-trade January 2026 backtest: 22 baseline trades vs 17 Ollama-filtered trades, with PnL, winrate, Sharpe, and veto breakdown."
 ---
 
 The January 2026 backtest ran two identical passes over the same parsed-signal set: one where every signal the parser accepted was executed immediately, and one where each signal first had to survive a veto check from a local Ollama LLM (`gpt-oss` quantized). The LLM evaluates candle-derived metrics — `avgRangePct` and `momentum24hPct` — against hard thresholds embedded in a system prompt, then returns a `riskAction: "skip" | "follow"` verdict. Both runs share the same entry price, take-profit (TP3), and stop-loss as configured in the strategy; the only difference is whether the LLM gate was active.
@@ -14,7 +14,7 @@ The January 2026 backtest ran two identical passes over the same parsed-signal s
 
 ## Summary: Baseline vs. Ollama
 
-The headline result is a **+16.68 percentage-point improvement in total PnL** by skipping just five signals out of twenty-two.
+The headline result is a **+16.68 percentage-point improvement in total PnL** by vetoing six signals (net −5 trades, because one additional trade was captured only in the Ollama run).
 
 | Metric | Without Ollama | With Ollama | Δ |
 |---|---|---|---|
@@ -207,16 +207,17 @@ Both thresholds are tunable in the system-prompt string without touching or reco
 
 </Accordion>
 
-The LLM response is validated against a Zod schema that requires:
+The LLM response is validated against a Zod schema (`RiskOutlineFormat` in `packages/core/src/contract/RiskOutline.ts`) that requires:
 
 ```typescript
-{
-  riskAction: z.enum(["skip", "follow"]),
-  riskSureLevel: z.number().min(0).max(1),
-  riskConfidence: z.number().min(0).max(1),
-  riskDescription: z.string(),
-  riskReasoning: z.string(),
-}
+// packages/core/src/contract/RiskOutline.ts
+export const RiskOutlineFormat = z.object({
+  action:      z.enum(["skip", "follow"]),
+  sure_level:  z.enum(["low", "low_medium", "medium", "medium_high", "high"]),
+  confidence:  z.enum(["reliable", "not_reliable"]),
+  description: z.string(),
+  reasoning:   z.string(),
+});
 ```
 
-Only when `riskAction === "follow"` does the strategy open a position.
+The raw LLM fields (`action`, `sure_level`, `confidence`) are mapped to the `screen-items` document fields `riskAction`, `riskSureLevel`, and `riskConfidence` by `SignalLogicService`. Only when `riskAction === "follow"` does the strategy open a position.

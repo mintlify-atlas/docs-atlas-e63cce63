@@ -98,7 +98,7 @@ The workspace contains two packages under `packages/` plus strategy files under 
 |---|---|
 | `backtest-kit` | Strategy execution engine, `Cron.register`, `Backtest.background`, `Live.background`, candle APIs |
 | `agent-swarm-kit` | `addOutline`, `ask`, `dumpOutlineResult` — wraps the Ollama inference call |
-| `ollama` | HTTP client for the local Ollama server (default `http://localhost:11434`) |
+| `ollama` | HTTP client used to call the Ollama API at `https://ollama.com`; bearer token passed via `CC_OLLAMA_TOKEN` |
 | `telegram` (GramJS) | MTProto client for reading Telegram channel messages |
 | `mongoose` | MongoDB ODM for `parser-items` and `screen-items` collections |
 | `ioredis` | Redis client used by `backtest-kit` internals |

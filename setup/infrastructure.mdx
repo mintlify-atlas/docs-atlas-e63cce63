@@ -129,23 +129,15 @@ docker exec redis redis-cli -a mysecurepassword ping
 
 ## Ollama
 
-Ollama does **not** have a Docker Compose file in this repository and must be installed and run separately. The risk-filter pipeline in `packages/core/src/logic/outline/risk.outline.ts` calls the `gpt-oss:120b` model for every parsed signal.
+Ollama does **not** have a Docker Compose file in this repository. The `getOllama` singleton in `packages/core/src/config/ollama.ts` connects to the **Ollama cloud service** at `https://ollama.com` and authenticates with a bearer token — it does not call a local Ollama process. The risk-filter pipeline calls the `gpt-oss:120b` model for every parsed signal.
 
-<CardGroup cols={2}>
-  <Card title="Install Ollama" icon="download" href="https://ollama.com">
-    Follow the official Ollama installation guide for your operating system at
-    **ollama.com**.
-  </Card>
-  <Card title="Pull the required model" icon="robot">
-    After installing Ollama, pull the model used by the risk outline:
+To authenticate, set `CC_OLLAMA_TOKEN` to your Ollama API key in `packages/core/.env`:
 
-    ```bash
-    ollama pull gpt-oss:120b
-    ```
-  </Card>
-</CardGroup>
+```bash
+CC_OLLAMA_TOKEN=your_ollama_api_key_here
+```
 
-Once Ollama is running, the `getOllama` singleton in `packages/core/src/config/ollama.ts` will connect to it automatically. If you are using a hosted Ollama endpoint instead of a local one, set `CC_OLLAMA_TOKEN` to your Bearer token in `packages/core/.env`.
+The `getOllama` singleton always sends `Authorization: Bearer <token>`. An empty `CC_OLLAMA_TOKEN` (the default) will be rejected by the Ollama cloud service — you must supply a valid token for the LLM risk filter to function.
 
 <Tip>
   When the Node.js application runs directly on your host machine but MongoDB
@@ -154,7 +146,7 @@ Once Ollama is running, the `getOllama` singleton in `packages/core/src/config/o
 
   ```bash
   CC_REDIS_HOST=host.docker.internal
-  CC_MONGO_CONNECTION_STRING=mongodb://host.docker.internal:27017/backtest-pro?wtimeoutMS=15000
+  CC_MONGO_CONNECTION_STRING=mongodb://host.docker.internal:27017/backtest-kit?wtimeoutMS=15000
   ```
 
   The root `.env.example` in the repository already contains these Docker-friendly

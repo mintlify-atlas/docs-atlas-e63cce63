@@ -4,14 +4,10 @@ sidebarTitle: "Quickstart"
 description: "Build the workspace packages, authenticate Telegram via QR code, and run the January 2026 backtest in under 10 minutes."
 ---
 
-Getting from a fresh clone to a completed backtest takes four terminal commands. The steps below follow the exact sequence in the README: build the workspace packages, authenticate your Telegram account via QR code, copy the resulting session file into the strategy folder, then launch the backtest engine against the January 2026 signal set. Before you begin, make sure MongoDB and Redis are reachable at their default ports and that Ollama is running locally with the `gpt-oss:120b` model pulled.
+Getting from a fresh clone to a completed backtest takes four terminal commands. The steps below follow the exact sequence in the README: build the workspace packages, authenticate your Telegram account via QR code, copy the resulting session file into the strategy folder, then launch the backtest engine against the January 2026 signal set. Before you begin, make sure MongoDB and Redis are reachable at their default ports and that you have a valid `CC_OLLAMA_TOKEN` for the Ollama cloud service (`https://ollama.com`) with the `gpt-oss:120b` model available on your account.
 
 <Note>
-  Ollama must be running on **`http://localhost:11434`** (the default) with the `gpt-oss:120b` model available. Pull it before running any step:
-  ```bash
-  ollama pull gpt-oss:120b
-  ```
-  The `CC_OLLAMA_URL` environment variable overrides the endpoint if you run Ollama on a different host or port.
+  The Ollama client in `packages/core/src/config/ollama.ts` connects to **`https://ollama.com`** (the Ollama cloud service) using a bearer token. Set `CC_OLLAMA_TOKEN` to your Ollama API key in `packages/core/.env` before running any step. Make sure the `gpt-oss:120b` model is available on your Ollama account.
 </Note>
 
 ## Steps
@@ -122,8 +118,8 @@ All configuration lives in a `.env` file at the repo root (loaded via `dotenv-cl
 | `CC_MONGO_CONNECTION_STRING` | `mongodb://localhost:27017/backtest-pro?wtimeoutMS=15000` | MongoDB connection string for `parser-items` and `screen-items` collections |
 | `CC_TELEGRAM_API_ID` | `31861455` | Telegram MTProto API ID |
 | `CC_TELEGRAM_API_HASH` | `ca60446c67ce250ee4e789c730163449` | Telegram MTProto API hash |
-| `CC_SYMBOL_LIST` | `BTCUSDT,POLUSDT,ZECUSDT,HYPEUSDT,DOGEUSDT,SOLUSDT,PENGUUSDT,TRXUSDT,HBARUSDT,NEARUSDT,FARTCOINUSDT,ETHUSDT,PUMPUSDT,ENAUSDT` | Comma-separated symbols for candle caching and strategy iteration |
-| `CC_OLLAMA_URL` | `http://localhost:11434` | Ollama HTTP endpoint |
+| `CC_SYMBOL_LIST` | `BTCUSDT,POLUSDT,ZECUSDT,HYPEUSDT,DOGEUSDT,SOLUSDT,PENGUUSDT,TRXUSDT,HBARUSDT,NEARUSDT,FARTCOINUSDT,ETHUSDT,PUMPUSDT` | Comma-separated symbols for candle caching and strategy iteration |
+| `CC_OLLAMA_TOKEN` | `` (empty) | Bearer token sent as the `Authorization` header to the Ollama cloud service at `https://ollama.com` |
 
 ---
 
