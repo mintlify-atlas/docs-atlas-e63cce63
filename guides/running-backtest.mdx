@@ -1,0 +1,276 @@
+---
+title: "Run a Historical Backtest with the LLM Risk Filter"
+sidebarTitle: "Backtest"
+description: "Replay Telegram signals through the Ollama risk filter over a historical date range and view results in the backtest-kit UI."
+---
+
+The backtest mode replays every Telegram signal published inside a configured date range, passes each one through the local Ollama LLM risk filter, and simulates position entries and exits against real historical OHLCV candles. Because the LLM is called with market context anchored at the signal's original publication time, there is no look-ahead bias — the verdict is identical to what a live run would have produced on that date.
+
+## Prerequisites
+
+Before running a backtest, make sure all of the following are in place.
+
+<CardGroup cols={2}>
+  <Card title="Packages built" icon="box">
+    Run `npm run build:x` (macOS/Linux) or `npm run build:win` (Windows) from the
+    repo root. Each workspace package emits `build/index.cjs` and a rolled-up
+    `types.d.ts` that the strategy file imports at runtime.
+  </Card>
+  <Card title="Telegram session authenticated" icon="telegram">
+    Run `cd ./packages/main && npm run auth`, scan the QR code with the Telegram
+    app, then copy the resulting `session.txt` into your strategy folder:
+    ```bash
+    cp packages/main/session.txt content/jan_2026.strategy/session.txt
+    ```
+  </Card>
+  <Card title="MongoDB + Redis running" icon="database">
+    The crawler writes raw messages to the `parser-items` MongoDB collection and
+    the LLM job service reads from it. Redis is used for caching and distributed
+    locking. Both must be reachable at their default ports before `npm start` is
+    invoked.
+  </Card>
+  <Card title="Ollama running with gpt-oss:120b" icon="robot">
+    The risk outline calls the local Ollama HTTP API at `CC_OLLAMA_URL`
+    (default `http://localhost:11434`). Pull the model before your first run:
+    ```bash
+    ollama pull gpt-oss:120b
+    ```
+  </Card>
+</CardGroup>
+
+## Backtest Command
+
+```bash
+npm start -- --backtest --ui --entry ./content/jan_2026.strategy/jan_2026.strategy.ts --cache
+```
+
+<Tabs>
+  <Tab title="Flag reference">
+    | Flag | Type | Description |
+    |------|------|-------------|
+    | `--backtest` | boolean | Activates backtest mode. `packages/main/src/main/backtest.ts` checks this flag and exits early if it is absent. |
+    | `--entry` | boolean (presence flag) | Tells `@backtest-kit/cli` to load the file path that follows it as the strategy entry point. The file is never bundled — it is loaded at runtime by the CLI. |
+    | `--ui` | boolean | Opens the backtest-kit web UI so you can inspect the trade log, equity curve, and per-trade details in a browser. |
+    | `--cache` | boolean | Pre-caches OHLCV candles for every symbol in `CC_SYMBOL_LIST` before the simulation starts. Uses the exchange schema's `getCandles` implementation and the frame schema's `startDate` / `endDate` to determine the download window. |
+
+    The `--entry` value must be the path to a strategy file that calls
+    `addStrategySchema(...)`, registers `Cron` handlers, and (optionally) imports
+    an exchange + frame schema module.
+  </Tab>
+  <Tab title="Environment variables">
+    | Variable | Default | Purpose |
+    |----------|---------|---------|
+    | `CC_MONGO_CONNECTION_STRING` | `mongodb://localhost:27017/backtest-pro?wtimeoutMS=15000` | MongoDB connection used by all `*DbService` classes |
+    | `CC_TELEGRAM_API_ID` | `31861455` | MTProto API ID for the Telegram crawler |
+    | `CC_TELEGRAM_API_HASH` | `ca60446c67ce250ee4e789c730163449` | MTProto API hash |
+    | `CC_SYMBOL_LIST` | `BTCUSDT,POLUSDT,ZECUSDT,...` | Comma-separated list of trading pairs crawled and simulated |
+    | `CC_OLLAMA_URL` | `http://localhost:11434` | Ollama HTTP endpoint serving `gpt-oss` |
+
+    Override any variable in a `.env` file at the repo root. The build scripts
+    load it automatically via `dotenv-cli`.
+  </Tab>
+</Tabs>
+
+## What Happens Step by Step
+
+<Steps>
+  <Step title="backtest.ts bootstraps and waits for readiness">
+    `@backtest-kit/cli` resolves `packages/main/src/main/backtest.ts` and calls
+    `main()`. The function first checks that both `--entry` and `--backtest` flags
+    are present, then calls:
+
+    ```typescript
+    await waitForReady(true);
+    ```
+
+    Passing `true` puts the framework into **backtest mode**. The function waits
+    for MongoDB, Redis, and the Ollama connection to all report healthy before
+    returning.
+  </Step>
+
+  <Step title="Strategy, exchange, and frame schemas are read">
+    After `waitForReady` resolves, the runner reads the schemas that were
+    registered by the strategy entry file and the module it imports:
+
+    ```typescript
+    const [strategySchema] = await listStrategySchema();
+    const [exchangeSchema] = await listExchangeSchema();
+    const [frameSchema]    = await listFrameSchema();
+    ```
+
+    For `jan_2026.strategy.ts` the frame schema is registered by
+    `content/jan_2026.strategy/modules/backtest.module.ts`:
+
+    ```typescript
+    addFrameSchema({
+      frameName: "jan_2026_frame",
+      interval: "1m",
+      startDate: new Date("2026-01-01T00:00:00Z"),
+      endDate:   new Date("2026-01-31T23:59:59Z"),
+      note: "January 2026",
+    });
+    ```
+
+    If any schema is missing the runner throws immediately with a descriptive
+    error.
+  </Step>
+
+  <Step title="Candles are pre-cached (if --cache is set)">
+    When `--cache` is present, `cacheCandles()` is called once for every symbol
+    in `CC_SYMBOL_LIST` using the exchange schema's `getCandles` implementation
+    and the frame date range:
+
+    ```typescript
+    for (const symbol of CC_SYMBOL_LIST) {
+      await cacheCandles({
+        exchangeName: exchangeSchema.exchangeName,
+        from: frameSchema.startDate,
+        to:   frameSchema.endDate,
+        interval: "1m",
+        symbol,
+      });
+    }
+    ```
+
+    Candles are stored locally so that subsequent runs and the per-tick price
+    feed never make live exchange requests during the simulation.
+  </Step>
+
+  <Step title="Backtest.background is called for each symbol">
+    With schemas resolved and candles cached, the runner launches a simulation
+    worker for each symbol:
+
+    ```typescript
+    for (const symbol of CC_SYMBOL_LIST) {
+      Backtest.background(symbol, {
+        exchangeName: exchangeSchema.exchangeName,
+        strategyName: strategySchema.strategyName,
+        frameName:    frameSchema.frameName,
+      });
+    }
+    ```
+
+    Each worker replays 1-minute candles from `startDate` to `endDate`,
+    calling `getSignal(symbol, when, currentPrice)` on every tick.
+  </Step>
+
+  <Step title="backtest-prepare-data cron fires on the first tick">
+    The strategy file registers a one-shot `Cron` handler named
+    `"backtest-prepare-data"`:
+
+    ```typescript
+    Cron.register({
+      name: "backtest-prepare-data",
+      handler: async (symbol, when, backtest) => {
+        if (!backtest) {
+          return;
+        }
+        await core.crawlerMainService.crawlBacktestFrame(when);
+      },
+    });
+    ```
+
+    Because no `interval` is set, this handler fires once at the start of the
+    simulation. `crawlBacktestFrame(when)` reads the frame's `startDate` and
+    `endDate` from the schema, calls `crawlerService.crawlRange(fromStamp, toStamp)`
+    to pull all Telegram messages for the full month, and upserts them into the
+    `parser-items` MongoDB collection.
+  </Step>
+
+  <Step title="signalJobSubject triggers LLM screening">
+    After the crawl completes, `crawlBacktestFrame` calls:
+
+    ```typescript
+    await signalJobSubject.next();
+    ```
+
+    This wakes `SignalJobService`, which iterates every unvisited `parser-items`
+    row whose `publishedAt` falls within the frame date range. For each row it
+    runs the LLM risk outline inside an execution context aligned to the signal's
+    publication minute:
+
+    ```typescript
+    const when = alignToInterval(row.publishedAt, "1m");
+    await ExecutionContextService.runInContext(
+      async () => self.signalLogicService.execute(row),
+      { symbol: row.symbol, when, backtest: true },
+    );
+    ```
+
+    The outline fetches 1m/15m candles at that historical timestamp, computes
+    `avgRangePct` and `momentum24hPct`, sends them to `gpt-oss:120b` via Ollama,
+    and stores the structured verdict (`riskAction`, `riskSureLevel`,
+    `riskConfidence`, `riskDescription`, `riskReasoning`) in the `screen-items`
+    collection. Rows are marked as visited after screening.
+  </Step>
+
+  <Step title="getSignal reads screen-items and returns positions">
+    On every subsequent price tick, `backtest-kit` calls the strategy's
+    `getSignal` function. The function queries the most recent LLM-screened record
+    from `screen-items` for that symbol using a 4-hour look-back window:
+
+    ```typescript
+    const signal = await core.signalMainService.getLast4HourSignal(symbol, when);
+    ```
+
+    Signals with `riskAction === "skip"` are rejected immediately. For surviving
+    signals the function additionally confirms that the current 1m close price
+    lies within the channel's published entry zone before returning a position
+    object:
+
+    ```typescript
+    return {
+      id:                  signal.id,
+      position:            signal.direction,        // "long" | "short"
+      priceStopLoss:       signal.stoploss,
+      priceTakeProfit:     signal.targets[2],       // third target (T3)
+      minuteEstimatedTime: Infinity,                // no time-based exit
+      note:                JSON.stringify(info, null, 2),
+    };
+    ```
+  </Step>
+</Steps>
+
+<Note>
+  The backtest replays at **historical candle prices** — Ollama is called with
+  the 1m/15m candle context that existed at the signal's original publication
+  time. Computed metrics (`avgRangePct`, `momentum24hPct`) reflect conditions
+  24 hours _before_ publication, so there is no forward-looking information in
+  the LLM prompt.
+</Note>
+
+## Controlling Which Symbols Are Processed
+
+The `CC_SYMBOL_LIST` environment variable controls every symbol processed by
+the crawler, the LLM screener, and the simulation workers. Set it in your `.env`
+file as a comma-separated list of exchange pair identifiers:
+
+```bash
+CC_SYMBOL_LIST=BTCUSDT,SOLUSDT,HYPEUSDT,NEARUSDT
+```
+
+The default value (defined in `packages/main/src/config/params.ts`) is:
+
+```
+BTCUSDT,POLUSDT,ZECUSDT,HYPEUSDT,DOGEUSDT,SOLUSDT,PENGUUSDT,TRXUSDT,HBARUSDT,NEARUSDT,FARTCOINUSDT,ETHUSDT,PUMPUSDT
+```
+
+Reducing the list speeds up both the candle-cache step and the LLM screening
+pass, which can be significant when running `gpt-oss:120b` locally.
+
+## January 2026 Results
+
+The table below shows the improvement the LLM gate produced on the same parsed-signal set:
+
+| Metric | Without Ollama | With Ollama | Δ |
+|--------|---------------|------------|---|
+| Total trades | 22 | **17** | −5 skipped |
+| Total PNL | +52.22% | **+68.90%** | **+16.68 pp** |
+| Winrate | 68% | **82%** | **+14 pp** |
+| Sharpe Ratio | +0.309 | **+0.512** | **+0.203** |
+| Profit factor | 2.73 | **6.37** | **+3.64** |
+| Expectancy / trade | +$2.37 | **+$4.05** | **+$1.68** |
+
+The LLM correctly vetoed 6 signals, of which 4 were losers totalling **−17.29%
+avoided**. The two skipped winners cost **−2.47%**, for a net filtering gain of
+**+14.82%**.

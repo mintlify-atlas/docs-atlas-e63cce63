@@ -1,0 +1,116 @@
+{
+  "projectType": "ai-ml",
+  "projectName": "backtest-ollama-crontab",
+  "projectDescription": "A TypeScript monorepo that wires a local Ollama LLM as an outline-based risk filter into a Telegram trading-signal pipeline, with a 15-minute crontab for live channel ingestion and a full backtest harness to measure whether the LLM gate improves P&L.",
+  "theme": "aspen",
+  "primaryColor": "#5B21B6",
+  "lightColor": "#7C3AED",
+  "darkColor": "#3B0764",
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Documentation",
+        "groups": [
+          {
+            "group": "Get Started",
+            "pages": [
+              "introduction",
+              "quickstart",
+              "architecture"
+            ]
+          },
+          {
+            "group": "Setup",
+            "pages": [
+              "setup/environment",
+              "setup/infrastructure",
+              "setup/telegram-auth"
+            ]
+          },
+          {
+            "group": "Core Concepts",
+            "pages": [
+              "concepts/pipeline",
+              "concepts/risk-outline",
+              "concepts/crontab-modes",
+              "concepts/data-flow"
+            ]
+          },
+          {
+            "group": "Running the System",
+            "pages": [
+              "guides/running-backtest",
+              "guides/running-live",
+              "guides/writing-strategies"
+            ]
+          },
+          {
+            "group": "Results & Analysis",
+            "pages": [
+              "results/backtest-report",
+              "results/channel-analysis"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "Reference",
+        "groups": [
+          {
+            "group": "Services",
+            "pages": [
+              "reference/crawler-service",
+              "reference/parser-service",
+              "reference/signal-job-service",
+              "reference/signal-logic-service"
+            ]
+          },
+          {
+            "group": "LLM Layer",
+            "pages": [
+              "reference/risk-outline",
+              "reference/completions",
+              "reference/advisors"
+            ]
+          },
+          {
+            "group": "Data Models",
+            "pages": [
+              "reference/schemas",
+              "reference/global-api"
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "keyFeatures": [
+    "Local Ollama LLM (gpt-oss quantized) wired as an outline-based risk filter for Telegram trading signals",
+    "15-minute crontab for live Telegram channel ingestion via Cron.register from backtest-kit",
+    "Full backtest harness replaying historical signals against the LLM gate (January 2026: +52.22% → +68.90%)",
+    "Structured zod-validated LLM output: riskAction (skip/follow), sure_level, confidence, description, reasoning",
+    "Two empirical veto rules embedded in LLM system prompt: sleeping-coin SHORT and knife-catching LONG",
+    "MongoDB + Redis infrastructure for parsed signals and screened results",
+    "Telegram MTProto session auth via QR code (gram.js TelegramClient)",
+    "Dependency-injection container (di-factory) exposing services via globalThis.core",
+    "TypeScript monorepo with separate @pro/core and @pro/main packages built with Rollup"
+  ],
+  "publicApiSurface": [
+    "globalThis.core — IoC container exposing all services",
+    "globalThis.runRiskOutline(params: RiskOutlineParams) — standalone risk outline runner",
+    "globalThis.addExchangeSchema(schema: IExchangeSchema) — register exchange for backtest-kit",
+    "addStrategySchema / getSignal — backtest-kit strategy registration",
+    "Cron.register({ name, handler, interval? }) — schedule live or one-shot cron handlers",
+    "CrawlerMainService.crawlLiveFrame(when) / crawlBacktestFrame(when)",
+    "SignalMainService.getLast4HourSignal(symbol, when) / getLast4HourScreen(symbol, when)",
+    "CrawlerService.crawlDay(stamp) / crawlRange(fromStamp, toStamp)",
+    "SignalJobService.enable() / disable()",
+    "SignalLogicService.execute(row: IParserRow): Promise<IScreenDto>",
+    "RiskOutlineFormat (zod schema) — action | sure_level | confidence | description | reasoning",
+    "OutlineName.RiskOutline — outline identifier for agent-swarm-kit",
+    "CompletionName.OllamaOutlineToolCompletion / OllamaOutlineFormatCompletion",
+    "AdvisorName.StockData1mAdvisor / StockData15mAdvisor",
+    "IScreenDto — fields: direction, entryFrom, entryTo, targets, stoploss, riskAction, riskSureLevel, riskConfidence, riskDescription, riskReasoning",
+    "IParserDto — fields: channel, messageId, publishedAt, symbol, direction, entry, targets, stoploss, visited"
+  ]
+}

@@ -1,0 +1,190 @@
+---
+title: "Data Flow: parser-items to screen-items Collections"
+sidebarTitle: "Data Flow"
+description: "How trading signals move from raw Telegram messages through two MongoDB collections and what fields are added at each stage."
+---
+
+Every signal in `backtest-ollama-crontab` passes through exactly two MongoDB collections on its journey from a raw Telegram message to an actionable trade. The first collection, `parser-items`, holds the structured extraction of the original message. The second, `screen-items`, holds a complete copy of that data enriched with the five LLM-generated risk fields. Each collection has a distinct set of indexes tuned for the access patterns that follow it in the pipeline. Understanding what lives where — and which service owns each write — makes it easy to debug, replay, or extend any stage.
+
+## Stage 1 — parser-items
+
+`parser-items` is written by `ParserDbService.create()`, called from `CrawlerService.crawlRange()` after `CryptoYodaScreenService` has parsed the raw Telegram message. Each document represents one fully-parsed signal message.
+
+### IParserDto interface
+
+```typescript
+// packages/core/src/schema/Parser.schema.ts
+interface IParserDto {
+  channel: string;          // Telegram channel identifier, e.g. "crypto_yoda_channel"
+  source: string;           // Same as channel (reserved for multi-source future use)
+  messageId: number;        // Telegram message ID — part of the unique compound index
+  publishedAt: Date;        // UTC timestamp of the original Telegram message
+  note: string;             // Raw message text as received from Telegram
+
+  symbol: string;           // Trading pair, e.g. "SOLUSDT"
+  direction: "long" | "short";
+  entry: { from: number; to: number };  // Entry price zone
+  targets: number[];        // Ordered take-profit levels (targets[2] is TP used by strategy)
+  stoploss: number;         // Hard stop-loss price level
+
+  content: unknown;         // Full parsed data object (Mixed, for audit)
+}
+
+interface IParserRow extends IParserDto {
+  id: string;               // MongoDB ObjectId as string
+  visited: boolean;         // false until SignalJobService processes this row
+  createDate: Date;
+  updatedDate: Date;
+}
+```
+
+### Field reference
+
+| Field | Type | Set by | Description |
+|---|---|---|---|
+| `channel` | `string` | `CrawlerService` | Channel name constant (`"crypto_yoda_channel"`) |
+| `source` | `string` | `CrawlerService` | Mirror of `channel` |
+| `messageId` | `number` | `CrawlerService` | Telegram message ID |
+| `publishedAt` | `Date` | `CrawlerService` | UTC publish timestamp from Telegram |
+| `note` | `string` | `CrawlerService` | Full raw message text |
+| `symbol` | `string` | `CryptoYodaScreenService` | Ticker suffixed with `USDT` |
+| `direction` | `"long" \| "short"` | `CryptoYodaScreenService` | Normalised from ШОРТ/ЛОНГ |
+| `entry.from` | `number` | `CryptoYodaScreenService` | Lower bound of entry zone |
+| `entry.to` | `number` | `CryptoYodaScreenService` | Upper bound of entry zone |
+| `targets` | `number[]` | `CryptoYodaScreenService` | Ordered take-profit prices |
+| `stoploss` | `number` | `CryptoYodaScreenService` | Hard stop-loss price |
+| `content` | `unknown` | `CrawlerService` | Full parsed payload (Mixed) |
+| `visited` | `boolean` | `ParserDbService.markVisited()` | `false` until LLM job completes |
+
+### MongoDB indexes on parser-items
+
+```typescript
+// Unique constraint: one document per (channel, messageId)
+ParserSchema.index({ channel: 1, messageId: 1 }, { unique: true });
+
+// Query pattern: latest signals for a given symbol
+ParserSchema.index({ symbol: 1, publishedAt: -1 });
+```
+
+Individual fields `channel`, `source`, `messageId`, `publishedAt`, `symbol`, and `visited` also carry single-field indexes to support the range queries in `ParserDbService.findAllByVisited(false)` and `findAllByPublishedAt(startDate, endDate)`.
+
+---
+
+## Stage 2 — screen-items
+
+`screen-items` is written by `ScreenDbService.create()`, called from `SignalJobService` after `SignalLogicService.execute()` returns a complete `IScreenDto`. Each document maps 1:1 to a `parser-items` row via the `parserItemId` foreign key and adds the five LLM risk fields.
+
+### IScreenDto interface
+
+```typescript
+// packages/core/src/schema/Screen.schema.ts
+interface IScreenDto {
+  parserItemId: string;     // ObjectId string of the originating parser-items document
+
+  channel: string;
+  source: string;
+  publishedAt: Date;
+  symbol: string;
+
+  direction: "long" | "short";
+  entryFrom: number;        // Flattened from parser entry.from
+  entryTo: number;          // Flattened from parser entry.to
+  targets: number[];
+  stoploss: number;
+
+  // LLM risk verdict fields (from RiskOutlineContract)
+  riskAction: "skip" | "follow";
+  riskSureLevel: "low" | "low_medium" | "medium" | "medium_high" | "high";
+  riskConfidence: "reliable" | "not_reliable";
+  riskDescription: string;  // 2-3 sentence human-readable verdict
+  riskReasoning: string;    // Step-by-step audit string with \n separators
+
+  note: string;             // Raw message text (copied from parser item)
+  content: unknown;         // Full parsed payload (copied from parser item)
+}
+
+interface IScreenRow extends IScreenDto {
+  id: string;
+  createDate: Date;
+  updatedDate: Date;
+}
+```
+
+### Field reference
+
+| Field | Type | Stage | Description |
+|---|---|---|---|
+| `parserItemId` | `string` | Stage 2 | Foreign key → `parser-items._id` |
+| `channel` | `string` | Stage 1 (copied) | Telegram channel identifier |
+| `source` | `string` | Stage 1 (copied) | Mirror of `channel` |
+| `publishedAt` | `Date` | Stage 1 (copied) | Original message UTC timestamp |
+| `symbol` | `string` | Stage 1 (copied) | Trading pair e.g. `"SOLUSDT"` |
+| `direction` | `"long" \| "short"` | Stage 1 (copied) | Trade direction |
+| `entryFrom` | `number` | Stage 2 (flattened) | Lower bound of entry zone |
+| `entryTo` | `number` | Stage 2 (flattened) | Upper bound of entry zone |
+| `targets` | `number[]` | Stage 1 (copied) | Take-profit levels |
+| `stoploss` | `number` | Stage 1 (copied) | Hard stop-loss price |
+| `riskAction` | `"skip" \| "follow"` | Stage 2 (LLM) | Primary veto decision |
+| `riskSureLevel` | 5-value enum | Stage 2 (LLM) | Accumulation confidence (audit) |
+| `riskConfidence` | `"reliable" \| "not_reliable"` | Stage 2 (LLM) | Data reliability (audit) |
+| `riskDescription` | `string` | Stage 2 (LLM) | 2-3 sentence verdict ≥ 30 chars |
+| `riskReasoning` | `string` | Stage 2 (LLM) | Step-by-step audit ≥ 80 chars |
+| `note` | `string` | Stage 1 (copied) | Raw Telegram message text |
+| `content` | `unknown` | Stage 1 (copied) | Full parsed payload (Mixed) |
+
+### MongoDB indexes on screen-items
+
+```typescript
+// Unique constraint: one screen record per parser item
+ScreenSchema.index({ parserItemId: 1 }, { unique: true });
+
+// Query pattern: latest risk verdicts for a given symbol
+ScreenSchema.index({ symbol: 1, publishedAt: -1 });
+```
+
+Individual fields `channel`, `source`, `publishedAt`, `symbol`, `riskSureLevel`, `riskConfidence`, and `riskAction` carry single-field indexes to support filtered queries and post-analysis dashboards.
+
+---
+
+## The getLast4HourSignal query
+
+The strategy's `getSignal` callback calls `SignalMainService.getLast4HourSignal(symbol, when)` on every price tick. This method queries `screen-items` for the most recent document for `symbol` where `publishedAt` is within 4 hours before `when`, returning the full `IScreenRow` or `null` if nothing is found.
+
+```typescript
+// Strategy usage — content/jan_2026.strategy/jan_2026.strategy.ts
+const signal = await core.signalMainService.getLast4HourSignal(symbol, when);
+
+if (!signal)                        return null;  // no recent signal
+if (signal.riskAction === "skip")   return null;  // LLM vetoed
+```
+
+The 4-hour window is intentional: it allows multiple price ticks to attempt entry into a signal's zone without re-querying the LLM. Once a signal ages out of the window, the symbol effectively has no active guidance until a new crawler run produces a fresh signal.
+
+<Note>
+  The `(symbol, publishedAt: -1)` compound index on `screen-items` makes `getLast4HourSignal` efficient regardless of collection size — MongoDB sorts in reverse `publishedAt` order and scans only the subset matching the symbol before applying the 4-hour date filter.
+</Note>
+
+---
+
+## End-to-end field lineage
+
+<CardGroup cols={2}>
+  <Card title="parser-items" icon="database">
+    **Written by:** `ParserDbService.create()` via `CrawlerService`
+
+    **Read by:** `ParserDbService.findAllByVisited(false)` in `SignalJobService`
+
+    **Key invariant:** `(channel, messageId)` unique — idempotent upsert on re-crawl
+
+    **Lifecycle flag:** `visited` flipped to `true` by `ParserDbService.markVisited()` after LLM job completes
+  </Card>
+  <Card title="screen-items" icon="shield-check">
+    **Written by:** `ScreenDbService.create()` in `SignalJobService`
+
+    **Read by:** `SignalMainService.getLast4HourSignal()` in strategy `getSignal`
+
+    **Key invariant:** `parserItemId` unique — each parser row produces at most one screen row
+
+    **Decision field:** `riskAction` — strategy returns `null` immediately if `"skip"`
+  </Card>
+</CardGroup>

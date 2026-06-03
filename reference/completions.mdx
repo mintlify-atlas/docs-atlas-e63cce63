@@ -1,0 +1,337 @@
+---
+title: "Ollama Completions: Tool-Call and Format-Based LLM Backends"
+sidebarTitle: "Completions"
+description: "Reference for OllamaOutlineToolCompletion and OllamaOutlineFormatCompletion, the two agent-swarm-kit completions that call a local Ollama gpt-oss model."
+---
+
+The pipeline ships two `agent-swarm-kit` completion registrations that both target the same local Ollama model (`gpt-oss:120b`) but differ in how they extract structured JSON from the model's response. `OllamaOutlineToolCompletion` uses Ollama's native tool-calling API to force the model to invoke a typed `provide_answer` function; `OllamaOutlineFormatCompletion` uses Ollama's built-in JSON format mode and parses the raw message body. Both share the same retry envelope, timeout guard, and `jsonrepair`-based recovery.
+
+## CompletionName Enum
+
+```typescript
+// src/enum/CompletionName.ts
+export enum CompletionName {
+    OllamaOutlineToolCompletion  = "ollama_outline_tool_completion",
+    OllamaOutlineFormatCompletion = "ollama_outline_format_completion",
+}
+```
+
+## Shared Constants
+
+Both completion files define the same set of tuning constants:
+
+```typescript
+const COMPLETION_MAX_ATTEMPTS   = 3;        // retries within a single fetch call
+const COMPLETION_MAX_RETRIES    = 5;        // outer retry wrapper invocations
+const COMPLETION_RETRY_DELAY    = 5_000;    // ms between outer retries
+const COMPLETION_TIMEOUT        = 300_000;  // ms per single ollama.chat() call (5 min)
+const MODEL_NAME                = "gpt-oss:120b";
+```
+
+<CardGroup cols={2}>
+  <Card title="COMPLETION_MAX_ATTEMPTS" icon="arrow-rotate-right">
+    **3** — maximum number of times the inner `while` loop retries the model within a single `fetchCompletion` invocation before throwing `"Model failed to use tool after maximum attempts"`.
+  </Card>
+  <Card title="COMPLETION_MAX_RETRIES" icon="rotate">
+    **5** — outer retry count passed to the `retry()` wrapper from `functools-kit`. Each outer retry begins a fresh `fetchCompletion` execution.
+  </Card>
+  <Card title="COMPLETION_RETRY_DELAY" icon="clock">
+    **5 000 ms** — pause between outer retries. The `retry()` wrapper waits this long before the next attempt after any thrown error.
+  </Card>
+  <Card title="COMPLETION_TIMEOUT" icon="timer">
+    **300 000 ms (5 min)** — per-call timeout enforced with `Promise.race`. If `ollama.chat()` doesn't resolve within 5 minutes, the race resolves with `COMPLETION_TIMEOUT_SYMBOL` and the attempt is counted as a failure.
+  </Card>
+</CardGroup>
+
+## Ollama Client Configuration
+
+Both completions obtain the Ollama client through the same `getOllama()` factory from `src/config/ollama.ts`. It is a `singleshot` — the `Ollama` instance is created exactly once and reused for the lifetime of the process.
+
+```typescript
+// src/config/ollama.ts
+import { singleshot } from "functools-kit";
+import { Ollama } from "ollama";
+import { CC_OLLAMA_TOKEN } from "./params";
+
+const getOllama = singleshot(
+  () =>
+    new Ollama({
+      host: "https://ollama.com",
+      headers: {
+        Authorization: `Bearer ${CC_OLLAMA_TOKEN}`,
+      },
+    }),
+);
+
+export { getOllama };
+```
+
+<Note>
+  The default `host` is `https://ollama.com` (the hosted Ollama cloud). For a locally-running Ollama instance, the host must be changed to `http://localhost:11434` and `CC_OLLAMA_TOKEN` can be left empty or omitted. Adjust the `params.ts` environment bindings accordingly.
+</Note>
+
+---
+
+## OllamaOutlineToolCompletion (primary)
+
+`OllamaOutlineToolCompletion` is the completion wired into `RiskOutline`. It forces the model to call a synthetic `provide_answer` tool, then extracts and validates the tool-call arguments as the structured response.
+
+### Registration
+
+```typescript
+addCompletion({
+  completionName: CompletionName.OllamaOutlineToolCompletion,
+  getCompletion: async (params: IOutlineCompletionArgs): Promise<IOutlineMessage> => {
+    return <IOutlineMessage> await fetchCompletion(params);
+  },
+  json: true,
+  flags: ["Всегда пиши ответ на русском языке", "Reasoning: high"],
+});
+```
+
+<ParamField path="completionName" type="string" required>
+  `"ollama_outline_tool_completion"` — the registry key used in `addOutline({ completion: ... })`.
+</ParamField>
+<ParamField path="json" type="boolean">
+  `true` — signals to `agent-swarm-kit` that this completion always returns JSON-serialisable content.
+</ParamField>
+<ParamField path="flags" type="string[]">
+  `["Всегда пиши ответ на русском языке", "Reasoning: high"]` — metadata flags consumed by the framework for logging and prompt injection.
+</ParamField>
+
+### Tool Definition
+
+The completion dynamically constructs a tool definition from the outline's `format` parameter (the zod-derived JSON schema):
+
+```typescript
+const schema =
+  "json_schema" in format
+    ? (Reflect.get(format, "json_schema.schema") ?? format)
+    : format;
+
+const toolDefinition = {
+  type: "function",
+  function: {
+    name: "provide_answer",
+    description: "Предоставить ответ в требуемом формате",
+    parameters: schema,
+  },
+};
+```
+
+A mandatory `system` message is prepended to every request to reinforce tool usage:
+
+```
+ОБЯЗАТЕЛЬНО используй инструмент provide_answer для предоставления ответа.
+НЕ отвечай обычным текстом.
+ВСЕГДА вызывай инструмент provide_answer с правильными параметрами.
+```
+
+### `ollama.chat()` Call
+
+```typescript
+const response = await Promise.race([
+  ollama.chat({
+    model: MODEL_NAME,       // "gpt-oss:120b"
+    messages,
+    tools: [toolDefinition],
+    think: false,
+  }),
+  sleep(COMPLETION_TIMEOUT).then(() => COMPLETION_TIMEOUT_SYMBOL),
+]);
+```
+
+`think: false` disables chain-of-thought tokens to keep responses compact and within the timeout budget.
+
+### Inner Retry Loop
+
+<Steps>
+  <Step title="Check for tool_calls in the response">
+    If `response.message.tool_calls` is empty or absent, the model responded with plain text. A user message is appended (only once per outer attempt via `singleshot`):
+
+    ```
+    Пожалуйста, используй инструмент provide_answer для предоставления ответа.
+    Не отвечай обычным текстом.
+    ```
+
+    Then `attempt++` and the loop continues.
+  </Step>
+  <Step title="Parse tool_call arguments with jsonrepair">
+    The `arguments` field may be a raw string or already-parsed object. In either case it is stringified, repaired with `jsonrepair`, then parsed:
+
+    ```typescript
+    const argumentsString =
+      typeof toolCall.function.arguments === "string"
+        ? toolCall.function.arguments
+        : JSON.stringify(toolCall.function.arguments);
+    const json = jsonrepair(argumentsString);
+    parsedArguments = JSON.parse(json);
+    ```
+
+    If parsing throws, the user reminder is appended and the loop retries.
+  </Step>
+  <Step title="Schema validation via validateToolArguments">
+    ```typescript
+    const validation = validateToolArguments(parsedArguments, schema);
+    if (!validation.success) {
+      // append reminder, attempt++, continue
+    }
+    ```
+
+    `validateToolArguments` is imported from `agent-swarm-kit` and checks the parsed object against the JSON schema derived from the zod format.
+  </Step>
+  <Step title="Return the assistant message">
+    On success the result is packed as an `IOutlineMessage`:
+
+    ```typescript
+    const result = {
+      role: "assistant" as const,
+      content: JSON.stringify(validation.data),
+    };
+    // Preserve thinking tokens if present:
+    response.message.thinking &&
+      Reflect.set(result, "_thinking", response.message.thinking);
+    return result;
+    ```
+  </Step>
+</Steps>
+
+### Full fetchCompletion Flow
+
+```typescript
+const fetchCompletion = retry(async ({
+  messages: rawMessages,
+  format,
+}: IOutlineCompletionArgs): Promise<IOutlineMessage> => {
+
+  const ollama = getOllama();
+  const schema = /* extract from format */;
+  const toolDefinition = { type: "function", function: { name: "provide_answer", ... } };
+  const systemMessage = { role: "system", content: "ОБЯЗАТЕЛЬНО используй инструмент..." };
+  const messages = [systemMessage, ...rawMessages];
+
+  let attempt = 0;
+  const addToolRequestMessage = singleshot(() => {
+    messages.push({ role: "user", content: "Пожалуйста, используй инструмент provide_answer..." });
+  });
+
+  while (attempt < COMPLETION_MAX_ATTEMPTS) {
+    const response = await Promise.race([ollama.chat({...}), sleep(COMPLETION_TIMEOUT).then(...)]);
+
+    if (typeof response === "symbol") throw new Error("Completion timed out");
+
+    const { tool_calls } = response.message;
+    if (!tool_calls?.length) { addToolRequestMessage(); attempt++; continue; }
+
+    // parse + jsonrepair + validateToolArguments ...
+    return { role: "assistant", content: JSON.stringify(validation.data) };
+  }
+
+  throw new Error("Model failed to use tool after maximum attempts");
+}, COMPLETION_MAX_RETRIES, COMPLETION_RETRY_DELAY);
+```
+
+---
+
+## OllamaOutlineFormatCompletion (alternative)
+
+`OllamaOutlineFormatCompletion` is the simpler alternative that uses Ollama's native `format` parameter to request JSON output directly, without a tool-call contract. It is useful for models that handle JSON-mode reliably but behave poorly with tool definitions.
+
+### Registration
+
+```typescript
+addCompletion({
+  completionName: CompletionName.OllamaOutlineFormatCompletion,
+  getCompletion: async (params: IOutlineCompletionArgs) => {
+    return <IOutlineMessage> await fetchCompletion(params);
+  },
+  flags: ["Всегда пиши ответ на русском языке", "Reasoning: high"],
+  json: true,
+});
+```
+
+### `ollama.chat()` Call
+
+```typescript
+const response = await Promise.race([
+  ollama.chat({
+    model: MODEL_NAME,  // "gpt-oss:120b"
+    messages: messages.map((message) => ({
+      content: message.content,
+      role: message.role,
+      tool_calls: message.tool_calls?.map((call) => ({ function: call.function })),
+    })),
+    format: schema,     // Ollama native JSON format mode
+    think: false,
+  }),
+  sleep(COMPLETION_TIMEOUT).then(() => COMPLETION_TIMEOUT_SYMBOL),
+]);
+```
+
+The key difference from the tool completion is that no `tools` array is passed; instead the `format` key activates Ollama's constrained JSON generation. The response body (`response.message.content`) is then repaired and validated:
+
+```typescript
+const json = jsonrepair(message.content);
+const parsedArguments = JSON.parse(json);
+const validation = validateToolArguments(parsedArguments, schema);
+if (!validation.success) {
+  throw new Error(`Attempt ${attempt + 1}: ${validation.error}`);
+}
+return { role: "assistant", content: json };
+```
+
+<Note>
+  The format completion's inner loop uses a `try/finally` block that always increments `attempt`, meaning it does not apply the `singleshot` reminder-message strategy used by the tool completion. Any validation failure immediately throws and propagates to the outer `retry()` wrapper.
+</Note>
+
+---
+
+## Side-by-Side Comparison
+
+<Tabs>
+  <Tab title="Tool Completion">
+    **Method:** `tools: [toolDefinition]` — model must call `provide_answer`
+
+    **Schema source:** Extracted from `format.json_schema.schema` (zod-derived OpenAI schema)
+
+    **Bad-response recovery:** Appends user reminder, retries up to `COMPLETION_MAX_ATTEMPTS` times within the same outer call
+
+    **JSON extraction:** `toolCall.function.arguments` → `jsonrepair` → `JSON.parse`
+
+    **Completion name:** `"ollama_outline_tool_completion"`
+
+    **Used by:** `RiskOutline` (wired as `completion: CompletionName.OllamaOutlineToolCompletion`)
+  </Tab>
+  <Tab title="Format Completion">
+    **Method:** `format: schema` — Ollama native JSON mode
+
+    **Schema source:** Same extraction logic as tool completion
+
+    **Bad-response recovery:** Throws on first validation failure; outer `retry()` handles it
+
+    **JSON extraction:** `response.message.content` → `jsonrepair` → `JSON.parse`
+
+    **Completion name:** `"ollama_outline_format_completion"`
+
+    **Used by:** Available as an alternative — swap `completion:` in `addOutline` to switch
+  </Tab>
+</Tabs>
+
+<Tip>
+  To switch `RiskOutline` from tool-calling to format mode, change the `completion` field in `addOutline`:
+
+  ```typescript
+  // risk.outline.ts
+  addOutline<RiskOutlineContract>({
+    outlineName: OutlineName.RiskOutline,
+    completion: CompletionName.OllamaOutlineFormatCompletion, // ← swap here
+    ...
+  });
+  ```
+
+  No other changes are needed; both completions accept identical `IOutlineCompletionArgs` and return `IOutlineMessage`.
+</Tip>
+
+<Warning>
+  Both completions share a 5-minute per-call timeout multiplied by up to 15 total attempts (3 inner × 5 outer). In the worst case, a single `RiskOutline` evaluation can take up to **75 minutes** before giving up. Size your crontab interval and queue depth accordingly.
+</Warning>

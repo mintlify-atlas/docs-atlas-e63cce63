@@ -1,0 +1,263 @@
+---
+title: "Five-Layer Pipeline: From Telegram to LLM-Gated Trades"
+sidebarTitle: "Architecture"
+description: "How backtest-ollama-crontab structures its crawl → parse → LLM risk filter → strategy → cron pipeline across two monorepo packages."
+---
+
+**backtest-ollama-crontab** is deliberately layered so that each concern — message retrieval, signal parsing, LLM risk assessment, trade execution, and scheduling — lives in its own file and can be reasoned about independently. The two workspace packages (`packages/core` and `packages/main`) divide infrastructure from entrypoints; strategy files in `content/` are loaded at runtime by `@backtest-kit/cli` and never bundled into either package. Understanding how these layers connect is the fastest path to modifying or extending the pipeline.
+
+---
+
+## The Five Pipeline Layers
+
+Each signal travels through five layers from raw Telegram message to an open (or vetoed) position. The table below maps each layer to the exact file responsible and what it does:
+
+| Layer | File | Responsibility |
+|---|---|---|
+| **Crawl** | `packages/core/src/lib/services/core/CrawlerService.ts` | Calls Telegram `iterMessages` on the configured channel and upserts raw messages into the `parser-items` MongoDB collection |
+| **Parse** | `packages/core/src/lib/services/screen/ChannelScreenService.ts` | Regex-extracts `direction`, `entry`, `targets`, and `stoploss` from each raw message text |
+| **Job** | `packages/core/src/lib/services/job/SignalJobService.ts` | Subscribes to `signalJobSubject`, iterates every unvisited row, and fans each one out to `SignalLogicService` |
+| **Outline** | `packages/core/src/logic/outline/risk.outline.ts` | Builds the Ollama prompt with pre-computed metrics (`avgRangePct`, `momentum24hPct`) and 1m/15m candles; parses the Zod-validated `riskAction` response |
+| **Logic** | `packages/core/src/lib/services/logic/SignalLogicService.ts` | Pure passthrough that writes the LLM verdict to the `screen-items` DTO |
+| **Schema** | `packages/core/src/schema/Screen.schema.ts` | Final MongoDB document: `direction`, `entryFrom/To`, `targets`, `stoploss`, `riskAction`, `riskSureLevel`, `riskConfidence`, `riskDescription`, `riskReasoning` |
+| **Strategy** | `content/jan_2026.strategy/jan_2026.strategy.ts` | Reads `screen-items`; opens a position only when `riskAction === "follow"` and live price is inside the entry zone |
+| **Cron** | Same strategy file, `Cron.register(...)` | `interval: "15m"` for live polling; no `interval` = one-shot backtest-prepare handler |
+
+<Note>
+  The "Crawl" and "Parse" layers share the same 15-minute crontab trigger in live mode. During backtest the crawler pulls the entire date-range frame at startup via the one-shot `Cron.register` handler (no `interval` set).
+</Note>
+
+---
+
+## Monorepo Layout
+
+```
+backtest-ollama-crontab/
+├── packages/
+│   ├── core/               # LLM logic, services, DI container → globalThis.core
+│   │   └── src/
+│   │       ├── config/     # Environment variable setup
+│   │       ├── contract/   # TypeScript contract types (e.g. RiskOutlineContract)
+│   │       ├── enum/       # OutlineName, CompletionName, AdvisorName
+│   │       ├── func/       # risk.function, exchange.function
+│   │       ├── lib/
+│   │       │   └── services/
+│   │       │       ├── base/   # LoggerService
+│   │       │       ├── core/   # CrawlerService, ParserService, ScraperService
+│   │       │       ├── db/     # ParserDbService, ScreenDbService
+│   │       │       ├── job/    # SignalJobService
+│   │       │       ├── logic/  # SignalLogicService
+│   │       │       ├── main/   # CrawlerMainService, SignalMainService
+│   │       │       └── screen/ # CryptoYodaScreenService
+│   │       ├── logic/
+│   │       │   └── outline/    # risk.outline.ts  ← LLM gate
+│   │       ├── model/      # Mongoose model definitions
+│   │       └── schema/     # Screen.schema.ts, Parser.schema.ts
+│   └── main/               # CLI entrypoints
+│       └── src/
+│           ├── config/     # params.ts — env var defaults
+│           ├── helpers/    # getArgs.ts — CLI flag parser
+│           └── main/       # backtest.ts, live.ts, paper.ts, session.ts
+├── content/
+│   └── jan_2026.strategy/  # Reference strategy + session.txt (not committed)
+├── scripts/
+│   ├── linux/build.sh
+│   └── win/build.bat
+├── tsconfig.json           # Path aliases: @pro/core, @pro/main
+└── package.json            # Workspace root
+```
+
+---
+
+## Dependency Injection: `di-factory` and `globalThis.core`
+
+`packages/core` uses the `di-factory` library as its DI container. Every service is bound with a named token from `TYPES` and retrieved via `inject<T>()`. When `packages/core/src/lib/index.ts` runs (it is the first import of the package), all services are bound, `init()` is called, and the resulting service map is attached to `globalThis.core`.
+
+```typescript
+// packages/core/src/lib/index.ts (simplified)
+import { inject, init } from "./core/di";
+import TYPES from "./core/types";
+import CrawlerService from "./services/core/CrawlerService";
+import SignalJobService from "./services/job/SignalJobService";
+// ...
+
+const jobServices = {
+  signalJobService: inject<SignalJobService>(TYPES.signalJobService),
+};
+
+// All service groups are merged onto globalThis.core
+```
+
+Strategy files and entrypoints in `packages/main` pull services from `globalThis.core` without knowing how they were constructed. The root `tsconfig.json` points `@pro/core` at `packages/core/types.d.ts` so TypeScript understands the shape of `globalThis.core` at edit time with no runtime overhead.
+
+---
+
+## The Two MongoDB Collections
+
+The pipeline persists signal data in two distinct collections:
+
+<CardGroup cols={2}>
+  <Card title="parser-items" icon="database">
+    Raw parsed signals written by `CrawlerService` and `ChannelScreenService`. Contains the channel message text, extracted `direction`, `entry`, `targets`, and `stoploss` fields. Each document is upserted by message ID so re-crawls are idempotent.
+  </Card>
+  <Card title="screen-items" icon="shield-check">
+    LLM-reviewed signals. Mirrors `parser-items` fields and adds the Ollama verdict fields: `riskAction` (`"follow"` or `"skip"`), `riskSureLevel`, `riskConfidence`, `riskDescription`, and `riskReasoning`. The strategy file queries this collection and filters on `riskAction === "follow"`.
+  </Card>
+</CardGroup>
+
+---
+
+## The LLM Risk Outline
+
+The risk filter lives in `packages/core/src/logic/outline/risk.outline.ts` and is the most important file in the pipeline. It uses `agent-swarm-kit`'s `addOutline` / `ask` / `dumpOutlineResult` APIs to wrap the Ollama inference call.
+
+<Accordion title="Two hard-coded veto rules in the system prompt">
+  The prompt is built with `str.newline(...)` from `functools-kit` and embeds two threshold constants:
+
+  ```typescript
+  const SHORT_MIN_AVG_RANGE_PCT = 0.07;
+  const LONG_MIN_MOMENTUM_24H_PCT = -1;
+  ```
+
+  **Rule 1 — sleeping-coin SHORT veto:** If `direction = SHORT` and `avgRangePct < 0.07%` → `action = "skip"`. A thin-liquidity asset is a stop-hunt target; one large candle sweeps short positions upward.
+
+  **Rule 2 — knife-catching LONG veto:** If `direction = LONG` and `momentum24hPct < −1%` → `action = "skip"`. The channel is calling a long entry into a declining market; the stop-loss almost always fires before any recovery.
+
+  **Rule 3 — default:** If neither rule fired → `action = "follow"`.
+</Accordion>
+
+<Accordion title="Metrics fed into the prompt">
+  Before the inference call, the outline computes two pre-processed metrics from the 24 hours of 1m candles prior to signal publication (up to `PRE_CANDLES_LIMIT = 1440` candles):
+
+  - **`avgRangePct`** — average (high − low) / low across 1m candles; measures how "active" or "sleeping" the asset is.
+  - **`momentum24hPct`** — percentage price change from 24h ago to the signal timestamp; measures trend direction.
+
+  These are passed to the model via `commitMetricsHistory` as a separate user message so the model reads them as ground truth rather than inferring them from raw candles.
+</Accordion>
+
+<Accordion title="Zod-validated response schema">
+  The response is validated against a Zod schema (`RiskOutlineContract`) that enforces:
+
+  ```typescript
+  riskAction:      "follow" | "skip"
+  riskSureLevel:   "low" | "low_medium" | "medium" | "medium_high" | "high"
+  riskConfidence:  "reliable" | "not_reliable"
+  riskDescription: string   // 2–3 sentences naming the rule with concrete numbers
+  riskReasoning:   string   // flat newline-delimited step trace, NOT a JSON object
+  ```
+
+  `jsonrepair` is listed as a dependency to handle malformed JSON that some quantized models occasionally emit.
+</Accordion>
+
+---
+
+## Build Pipeline
+
+Each package is independently buildable. The root build scripts (`npm run build:x` on Linux/macOS, `npm run build:win` on Windows) call `scripts/linux/build.sh` (or its Windows equivalent), which loops over every directory in `packages/` and runs `npm install && npm run build` inside it.
+
+```bash
+# scripts/linux/build.sh
+cd packages
+for D in `find . -maxdepth 1 -not -path "." -not -path "./.*" -type d`
+do
+    cd $D
+    npm install
+    npm run build
+    cd ..
+done
+cd ..
+```
+
+Each package's own Rollup config produces:
+
+| Output | Description |
+|---|---|
+| `build/index.cjs` | CommonJS bundle including all local source; peer dependencies are externalised |
+| `types.d.ts` | Rolled-up type declarations via `rollup-plugin-dts`; this is what `@pro/core` / `@pro/main` resolve to in `tsconfig.json` |
+
+<Tip>
+  Strategy files in `content/` are loaded at runtime by `@backtest-kit/cli`. They are TypeScript source files — the CLI transpiles them on the fly. They import from `@pro/core` and `@pro/main` which resolve to the rolled-up `types.d.ts` files for type-checking, while the runtime CJS bundles in `build/index.cjs` provide the actual implementations via `globalThis.core`.
+</Tip>
+
+---
+
+## Mode Detection: Backtest vs Live
+
+`backtest-kit` exposes three utilities that let the same strategy code behave correctly in both contexts:
+
+| API | What it does |
+|---|---|
+| `getMode()` | Returns `"backtest"` or `"live"` depending on the CLI flag that launched the process |
+| `getContext()` | Returns the current execution context (symbol, timestamp, candle data) being processed |
+| `ExecutionContextService` | Injectable service that tracks which symbol/frame/strategy triple is currently active |
+
+In `backtest.ts`, `waitForReady(true)` signals a backtest boot; in `live.ts`, `waitForReady(false)` signals live. The boolean propagates through `backtest-kit` internals so `getMode()` returns the correct value everywhere without any manual plumbing.
+
+The crontab registration in the strategy file exploits the same detection:
+
+```typescript
+// content/jan_2026.strategy/jan_2026.strategy.ts (schematic)
+Cron.register({
+  interval: "15m",   // only fires on ticks in live mode
+  handler: async () => { /* crawl + parse + LLM filter */ }
+});
+
+Cron.register({
+  // no interval = one-shot, fires once at startup in backtest mode
+  handler: async () => { /* pull full frame and populate parser-items */ }
+});
+```
+
+---
+
+## Entrypoint Flow Diagram
+
+```
+npm start -- --backtest --entry <strategy> --cache
+         │
+         ▼
+  @backtest-kit/cli
+         │  loads strategy file at runtime
+         ▼
+  packages/main/src/index.ts
+  ├── main/session.ts   (no-op: --session not set)
+  ├── main/backtest.ts  ← active
+  ├── main/live.ts      (no-op: --live not set)
+  └── main/paper.ts     (no-op: --paper not set)
+         │
+         ▼  waitForReady(true)
+         │
+         ├── [--cache] cacheCandles for each CC_SYMBOL_LIST symbol
+         │
+         └── Backtest.background(symbol, { exchangeName, strategyName, frameName })
+                    │  per-symbol parallel replay
+                    ▼
+             Strategy cron tick (15m interval replayed)
+                    │
+                    ├── CrawlerService.iterMessages → parser-items
+                    ├── ChannelScreenService.extract → parser-items fields
+                    ├── SignalJobService → SignalLogicService
+                    ├── risk.outline.ts → Ollama → riskAction
+                    └── screen-items upsert
+                           │
+                           ▼
+                    Strategy reads screen-items
+                    └── riskAction === "follow" → open position
+```
+
+---
+
+<CardGroup cols={2}>
+  <Card title="Risk Outline Concepts" icon="brain" href="/concepts/risk-outline">
+    Deep-dive into how the LLM prompt is constructed, the metrics packet, and the Zod response contract.
+  </Card>
+  <Card title="Quickstart" icon="rocket" href="/quickstart">
+    Build, authenticate, and run the backtest in four steps.
+  </Card>
+  <Card title="Backtest Report" icon="chart-bar" href="/results/backtest-report">
+    Full January 2026 trade log and before/after Ollama statistics.
+  </Card>
+  <Card title="Introduction" icon="book-open" href="/introduction">
+    Project overview, the two empirical rules, and key dependencies.
+  </Card>
+</CardGroup>

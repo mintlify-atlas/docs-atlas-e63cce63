@@ -1,0 +1,335 @@
+---
+title: "Write a Custom Strategy with the LLM Risk Filter"
+sidebarTitle: "Writing Strategies"
+description: "Build a custom backtest-kit strategy that reads LLM-screened signals from screen-items and applies your own position management logic."
+---
+
+Strategy files in this monorepo are intentionally kept outside the compiled workspace packages. They live under `./content/` and are loaded at runtime by `@backtest-kit/cli` via the `--entry` flag, so you can iterate on strategy logic without rebuilding anything. The only contract a strategy file must satisfy is calling `addStrategySchema(...)` and, optionally, registering `Cron` handlers and lifecycle callbacks.
+
+## File Layout
+
+A strategy directory typically contains three files:
+
+```
+content/
+└── my_strategy/
+    ├── my_strategy.strategy.ts   ← loaded by --entry
+    ├── my_strategy.test.ts       ← baseline variant without LLM filter
+    └── modules/
+        └── backtest.module.ts    ← addExchangeSchema + addFrameSchema
+```
+
+The `--entry` path points directly at the `*.strategy.ts` file. The module file
+(`backtest.module.ts`) is imported from inside the strategy and registers the
+exchange and frame schemas needed for candle fetching and date-range bounding.
+
+## Registering a Strategy
+
+`addStrategySchema` is the main entrypoint. Pass it a `strategyName` and a
+`getSignal` function:
+
+```typescript
+import { addStrategySchema } from "backtest-kit";
+
+addStrategySchema({
+  strategyName: "jan_2026_strategy",
+  getSignal: async (symbol, when, currentPrice) => {
+    // ... see below
+  },
+});
+```
+
+`strategyName` must match the value returned by `listStrategySchema()` in the
+runner files — backtest and live runners both pick `[0]` from the list, so only
+one schema should be registered per process.
+
+## Implementing getSignal
+
+`getSignal(symbol, when, currentPrice)` is called on every price tick. It must
+return a position descriptor or `null` to skip the tick. The complete
+implementation from `jan_2026.strategy.ts` illustrates the recommended pattern:
+
+```typescript
+getSignal: async (symbol, when, currentPrice) => {
+  console.log(symbol, when);
+
+  // 1. Fetch the latest LLM-screened signal within the last 4 hours
+  const signal = await core.signalMainService.getLast4HourSignal(symbol, when);
+
+  if (!signal) {
+    return null;
+  }
+
+  // 2. Respect the LLM verdict — empirical rules live in the outline prompt,
+  //    not here. The strategy only follows the verdict.
+  if (signal.riskAction === "skip") {
+    return null;
+  }
+
+  // 3. Confirm the current price is inside the channel's entry zone
+  const closePrice = await getClosePrice(symbol, "1m");
+  if (closePrice < signal.entryFrom || closePrice > signal.entryTo) {
+    return null;
+  }
+
+  // 4. Assemble the note for audit purposes
+  const info = {
+    publishedAt: signal.publishedAt,
+    data: {
+      direction: signal.direction,
+      entryFrom: signal.entryFrom,
+      entryTo:   signal.entryTo,
+      targets:   signal.targets,
+      stoploss:  signal.stoploss,
+    },
+    risk: {
+      action:      signal.riskAction,
+      sureLevel:   signal.riskSureLevel,
+      confidence:  signal.riskConfidence,
+      description: signal.riskDescription,
+      reasoning:   signal.riskReasoning,
+    },
+    parsed: signal.note,
+  };
+
+  // 5. Return the position descriptor
+  return {
+    id:                  signal.id,
+    position:            signal.direction,    // "long" | "short"
+    priceStopLoss:       signal.stoploss,
+    priceTakeProfit:     signal.targets[2],   // third target (T3)
+    minuteEstimatedTime: Infinity,            // no time-based exit
+    note:                JSON.stringify(info, null, 2),
+  };
+},
+```
+
+### Position Fields
+
+| Field | Source | Description |
+|-------|--------|-------------|
+| `id` | `signal.id` | Unique identifier of the `screen-items` document — used to correlate a live position back to the original Telegram signal |
+| `position` | `signal.direction` | `"long"` or `"short"` as parsed from the channel message |
+| `priceStopLoss` | `signal.stoploss` | Hard stop-loss price published in the channel signal |
+| `priceTakeProfit` | `signal.targets[2]` | Third take-profit target (T3) — the channel typically publishes three targets; T3 offers the widest reward-to-risk ratio |
+| `minuteEstimatedTime` | `Infinity` | Setting this to `Infinity` disables the time-based exit so the position stays open until TP or SL is hit |
+| `note` | `JSON.stringify(info)` | Stringified JSON blob written to the trade log for post-analysis; includes the full signal data and LLM risk fields |
+
+### How getLast4HourSignal Works
+
+`core.signalMainService.getLast4HourSignal(symbol, when)` delegates to
+`ScreenDbService.findLast4HourRow(symbol, when)`, which queries `screen-items`
+for the most recent document matching `symbol` whose `publishedAt` falls within
+the four hours preceding `when`. In backtest mode `when` is the simulated
+candle timestamp; in live mode it is the current wall-clock minute. If no
+screened signal exists in that window the method returns `null` and `getSignal`
+skips the tick.
+
+## Lifecycle Callbacks
+
+### listenActivePing
+
+`listenActivePing` fires on every price tick while at least one position is
+open. Use it for monitoring, trailing-stop logic, or dynamic exit decisions.
+The callback receives `symbol`, `data` (the original position descriptor), and
+`currentPrice`:
+
+```typescript
+import {
+  listenActivePing,
+  Log,
+  getPositionHighestProfitDistancePnlCost,
+  getPositionHighestMaxDrawdownPnlCost,
+  getPositionPnlCost,
+} from "backtest-kit";
+
+listenActivePing(async ({ symbol, data, currentPrice }) => {
+  const peakProfitDistance = await getPositionHighestProfitDistancePnlCost(symbol);
+  const peakMaxDrawdown    = await getPositionHighestMaxDrawdownPnlCost(symbol);
+  const currentPnl         = await getPositionPnlCost(symbol);
+  Log.info("position active", {
+    symbol,
+    signalId:    data.id,
+    priceOpen:   data.priceOpen,
+    takeProfit:  data.priceTakeProfit,
+    stopLoss:    data.priceStopLoss,
+    currentPrice,
+    peakProfitDistance,
+    peakMaxDrawdown,
+    currentPnl,
+  });
+});
+```
+
+### listenError
+
+`listenError` captures any uncaught error thrown inside the strategy. Forward
+it to `Log.debug` so it appears in the UI log panel alongside position events:
+
+```typescript
+import { listenError, Log } from "backtest-kit";
+import { errorData, getErrorMessage } from "functools-kit";
+
+listenError((error) => {
+  console.log(error);
+  Log.debug("error", {
+    error:   errorData(error),
+    message: getErrorMessage(error),
+  });
+});
+```
+
+## Registering Cron Handlers
+
+`Cron.register` schedules data-fetching work so that the strategy is self-
+contained. The `jan_2026.strategy.ts` registers two complementary handlers —
+one for backtest, one for live — that share the same cron infrastructure but
+branch on the `backtest` flag:
+
+<CodeGroup>
+```typescript backtest-prepare-data
+// No `interval` → fires once at simulation start
+Cron.register({
+  name: "backtest-prepare-data",
+  handler: async (symbol, when, backtest) => {
+    if (!backtest) {
+      return;
+    }
+    console.log(`Fetching backtest data symbol=${symbol} when=${when}`);
+    await core.crawlerMainService.crawlBacktestFrame(when);
+  },
+});
+```
+
+```typescript live-fetch-data
+// interval: "15m" → re-fires every 15 minutes in live mode
+Cron.register({
+  name: "live-fetch-data",
+  handler: async (symbol, when, backtest) => {
+    if (backtest) {
+      return;
+    }
+    console.log(`Fetching live data symbol=${symbol} when=${when}`);
+    await core.crawlerMainService.crawlLiveFrame(when);
+  },
+  interval: "15m",
+});
+```
+</CodeGroup>
+
+Omitting `interval` makes the handler a **one-shot** that fires on the first
+tick of each symbol worker. Adding `interval: "15m"` schedules recurring
+execution at that cadence. Both handlers receive the same three arguments:
+`symbol` (current worker symbol), `when` (current candle timestamp), and
+`backtest` (boolean mode flag).
+
+## Registering an Exchange Schema
+
+The exchange schema is typically registered in a `modules/backtest.module.ts`
+file imported by the strategy. The `globalThis.addExchangeSchema` function
+(defined in `packages/core/src/func/exchange.function.ts`) is a thin wrapper
+around `backtest-kit`'s `addExchangeSchema`:
+
+```typescript
+// packages/core/src/func/exchange.function.ts
+import { addExchangeSchema, IExchangeSchema } from "backtest-kit";
+
+function addExchangeSchemaFn(exchangeSchema: IExchangeSchema) {
+  addExchangeSchema(exchangeSchema);
+}
+
+declare global {
+  var addExchangeSchema: typeof addExchangeSchemaFn;
+}
+
+Object.assign(globalThis, {
+  addExchangeSchema: addExchangeSchemaFn,
+});
+```
+
+Call it directly from your module with a `ccxt` adapter or any custom
+implementation that satisfies `IExchangeSchema`:
+
+```typescript
+addExchangeSchema({
+  exchangeName: "ccxt-exchange",
+  getCandles: async (symbol, interval, since, limit) => { /* ... */ },
+  getOrderBook: async (symbol, depth, _from, _to, backtest) => { /* ... */ },
+  getAggregatedTrades: async (symbol, from, to) => { /* ... */ },
+  formatPrice: async (symbol, price) => { /* ... */ },
+  formatQuantity: async (symbol, quantity) => { /* ... */ },
+});
+```
+
+## Manually Invoking the Risk Outline
+
+`globalThis.runRiskOutline` (defined in `packages/core/src/func/risk.function.ts`)
+lets you call the LLM risk filter directly — useful for one-off signal
+evaluation in a REPL or a test script — without going through the full crawl
+and job-queue pipeline:
+
+```typescript
+// packages/core/src/func/risk.function.ts
+interface RiskOutlineParams {
+  symbol:       string;
+  publishedAt:  Date;
+  exchangeName: string;
+  direction:    "short" | "long";
+  targets:      number[];
+  stoploss:     number;
+}
+
+// Exposed on globalThis via Object.assign
+declare var runRiskOutline: (params: RiskOutlineParams) => Promise<RiskOutlineContract>;
+```
+
+Example usage from a script or the Node REPL:
+
+```typescript
+const result = await globalThis.runRiskOutline({
+  symbol:       "SOLUSDT",
+  publishedAt:  new Date("2026-01-05T07:00:00Z"),
+  exchangeName: "ccxt-exchange",
+  direction:    "long",
+  targets:      [136.00, 138.00, 140.00],
+  stoploss:     131.50,
+});
+
+console.log(result.action);       // "follow" | "skip"
+console.log(result.description);  // human-readable verdict
+console.log(result.reasoning);    // step-by-step rule log
+```
+
+Internally `runRiskOutline` calls `runInMockContext` with `backtest: true`, so
+candles are fetched from the local cache at the publication timestamp rather
+than from the live exchange.
+
+## Signal Schema Reference
+
+The `screen-items` document returned by `getLast4HourSignal` exposes the
+following fields used by the strategy:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `id` | `string` | MongoDB document ID |
+| `direction` | `"long" \| "short"` | Trade direction parsed from the channel message |
+| `entryFrom` | `number` | Lower bound of the published entry zone |
+| `entryTo` | `number` | Upper bound of the published entry zone |
+| `targets` | `number[]` | Array of take-profit levels; `[0]` = T1, `[1]` = T2, `[2]` = T3 |
+| `stoploss` | `number` | Hard stop-loss price |
+| `publishedAt` | `Date` | Original Telegram message timestamp |
+| `riskAction` | `"follow" \| "skip"` | LLM verdict |
+| `riskSureLevel` | `string` | Accumulation confidence: `"low"`, `"low_medium"`, `"medium"`, `"medium_high"`, or `"high"` |
+| `riskConfidence` | `string` | Data reliability: `"reliable"` or `"not_reliable"` |
+| `riskDescription` | `string` | 2–3 sentence verdict citing the rule applied and the metric values |
+| `riskReasoning` | `string` | Step-by-step plain-text log of rule evaluation |
+| `note` | `string` | Raw parsed signal text stored by the crawler |
+
+<Tip>
+  To adapt the pipeline to a new Telegram channel, implement a new screen
+  service following the `CryptoYodaScreenService` pattern. The service needs to
+  extract `direction`, `entry`, `targets`, and `stoploss` from the channel's
+  message format and upsert the result into `parser-items`. The rest of the
+  pipeline — LLM screening, `screen-items` storage, and strategy integration —
+  is channel-agnostic and requires no changes.
+</Tip>

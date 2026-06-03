@@ -1,0 +1,187 @@
+---
+title: "Authenticate Telegram MTProto via QR Code"
+sidebarTitle: "Telegram Auth"
+description: "Generate a Telegram MTProto session file using the built-in QR-code auth flow, then deploy the session to your strategy directory."
+---
+
+The crawler at the heart of `backtest-ollama-crontab` reads messages directly from public Telegram channels using the **MTProto protocol** via the `gram.js` `TelegramClient`. Unlike the Telegram Bot API, MTProto authenticates as a real Telegram user account, which means it can read any channel your account has access to — no channel administrator permission is needed. Authentication happens once via a QR code, and the resulting session is serialised to a plain text file that the application loads on every subsequent start.
+
+---
+
+## Why MTProto instead of the Bot API?
+
+The Bot API only delivers messages to bots that are explicitly added to a channel. MTProto client authentication (the same protocol used by the official Telegram desktop app) lets the application subscribe to any channel as a regular user. The `getTelegram` singleton in `packages/core/src/config/telegram.ts` reads `session.txt`, deserialises it into a `StringSession`, and hands back an authenticated `TelegramClient` that can call `iterMessages` on any channel the account follows.
+
+```typescript packages/core/src/config/telegram.ts
+import { singleshot } from "functools-kit";
+import { TelegramClient } from "telegram";
+import { StringSession } from "telegram/sessions";
+import { CC_TELEGRAM_API_HASH, CC_TELEGRAM_API_ID } from "./params";
+import { readFile } from "fs/promises";
+
+export const getTelegram = singleshot(async () => {
+    try {
+        const session = await readFile("./session.txt", "utf-8");
+        const stringSession = new StringSession(session);
+        const client = new TelegramClient(stringSession, CC_TELEGRAM_API_ID, CC_TELEGRAM_API_HASH, {
+            connectionRetries: 5,
+            systemVersion: "Windows 10",
+            deviceModel: "Desktop",
+            appVersion: "1.0.0",
+        });
+        {
+            await client.connect();
+            await client.getMe();
+        }
+        return client;
+    } catch (error) {
+        console.error("No session found. Please run 'npm start -- --auth' to create a session.");
+        throw error;
+    }
+});
+```
+
+The `singleshot` wrapper from `functools-kit` ensures the async initialisation runs exactly once — concurrent callers all await the same promise rather than opening multiple connections.
+
+### The `StringSession` mechanism
+
+`StringSession` is a gram.js session adapter that serialises the entire MTProto session state (server keys, auth keys, DC assignments) into a single base64-like string. Writing this string to `session.txt` and reading it back on the next run means the client never needs to re-authenticate, even across process restarts. If the string is empty (as during the initial auth flow), gram.js starts a fresh session from scratch.
+
+<Note>
+  If `session.txt` is missing or unreadable when `getTelegram` is called, the
+  function logs `"No session found. Please run 'npm start -- --auth' to create a
+  session."` to `stderr` and re-throws the underlying error, which will crash the
+  crontab with a clear diagnostic message rather than failing silently mid-run.
+</Note>
+
+---
+
+## Prerequisites
+
+Before running the auth command, make sure the following environment variables are set in `packages/main/.env` (or exported in your shell). These are the MTProto application credentials registered at [my.telegram.org](https://my.telegram.org):
+
+<ParamField path="CC_TELEGRAM_API_ID" type="number" default="31861455">
+  Your MTProto application's numeric API ID. Log in to
+  [my.telegram.org](https://my.telegram.org), open **API development tools**,
+  and copy the `App api_id` value. The repository ships a default development
+  credential — replace it with your own for any serious use.
+</ParamField>
+
+<ParamField path="CC_TELEGRAM_API_HASH" type="string" default="ca60446c67ce250ee4e789c730163449">
+  Your MTProto application's API hash, shown on the same
+  [my.telegram.org](https://my.telegram.org) dashboard page alongside the API
+  ID. Treat this value like a password.
+</ParamField>
+
+---
+
+## Authentication walkthrough
+
+<Steps>
+
+  <Step title="Navigate to the main package">
+    Open a terminal at the repository root and change into the `packages/main`
+    directory:
+
+    ```bash
+    cd ./packages/main
+    ```
+
+    Make sure dependencies are installed and the workspace has been built before
+    continuing:
+
+    ```bash
+    # From the repo root (if not already done)
+    npm run build:x   # macOS / Linux
+    npm run build:win # Windows
+    ```
+  </Step>
+
+  <Step title="Run the auth command">
+    Start the QR-code authentication flow:
+
+    ```bash
+    npm run auth
+    ```
+
+    Internally this invokes `packages/main/src/main/session.ts`, which calls
+    `client.signInUserWithQrCode(...)` from gram.js. The terminal clears and a
+    QR code is rendered using `qrcode-terminal`.
+
+    ```
+    Scan this QR code in Telegram app (Settings -> Devices -> Link Desktop Device):
+
+    █████████████████████████
+    █ ▄▄▄▄▄ █▀█ █▄█ ▄▄▄▄▄ █
+    █ █   █ █▀▀▀█ █ █   █ █
+    ...
+    ```
+
+    If your Telegram account has **two-factor authentication (2FA)** enabled, the
+    terminal will prompt `Enter your 2FA password:` after a successful scan —
+    type your cloud password and press Enter.
+  </Step>
+
+  <Step title="Scan the QR code with Telegram mobile">
+    On your phone, open the Telegram app and navigate to:
+
+    **Settings → Devices → Link Desktop Device**
+
+    Point the in-app camera at the QR code in your terminal. The phone
+    authorises the new session on the Telegram server side. When the connection
+    is confirmed, the terminal prints:
+
+    ```
+    Connected!
+    Session saved to ./session.txt
+    ```
+  </Step>
+
+  <Step title="Verify session.txt was created">
+    Confirm the file exists in the `packages/main` directory:
+
+    ```bash
+    ls -lh packages/main/session.txt
+    ```
+
+    The file contains a single long base64-like string — the serialised
+    `StringSession`. Keep it secret and do not open it in a GUI text editor that
+    syncs to the cloud.
+  </Step>
+
+  <Step title="Copy the session file into your strategy directory">
+    The strategy reads `session.txt` relative to its own working directory.
+    Copy the file into the strategy folder before running a backtest or going
+    live:
+
+    ```bash
+    cp packages/main/session.txt content/jan_2026.strategy/session.txt
+    ```
+
+    Each strategy directory that needs Telegram access must have its own copy.
+    If you create a new strategy, repeat this copy step — the session string
+    itself is reusable across directories.
+  </Step>
+
+</Steps>
+
+---
+
+## Security considerations
+
+<Warning>
+  `session.txt` is equivalent to a **long-lived login token** for your Telegram
+  account. Anyone who obtains this file can read your messages and act as you on
+  Telegram until the session is revoked. The file is already listed in the
+  repository's `.gitignore` — confirm it is excluded before every `git push`.
+  To revoke a compromised session, go to **Settings → Devices** in Telegram and
+  terminate the suspicious session.
+</Warning>
+
+<Tip>
+  You can generate the session once on a developer machine and then securely
+  transfer `session.txt` to a production server via `scp` or a secrets manager.
+  The session string is self-contained and does not need to be regenerated unless
+  it is explicitly revoked or expires due to inactivity (Telegram invalidates
+  sessions after roughly 6 months of no use).
+</Tip>

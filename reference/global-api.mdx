@@ -1,0 +1,333 @@
+---
+title: "Global API: globalThis.core and Helper Functions"
+sidebarTitle: "Global API"
+description: "Reference for the globalThis.core IoC container, runRiskOutline, and addExchangeSchema globals that make the service layer accessible from strategy files."
+---
+
+When `packages/core/src/index.ts` is loaded, it registers three globals on `globalThis`: the **`core`** IoC container that exposes every service in the pipeline, the **`runRiskOutline`** helper that lets a strategy file invoke the Ollama risk filter against historical OHLCV data, and **`addExchangeSchema`** which registers an exchange data source with the `backtest-kit` runtime. Together these three globals form the entire public surface area a strategy or backtest script needs — no direct imports are required.
+
+---
+
+## `globalThis.core` — IoC Container
+
+`core` is a plain object assembled in `packages/core/src/lib/index.ts` by calling `inject<T>(Symbol)` for each registered service. The services are lazily initialised on first property access by the `di-kit` activator. The full TypeScript ambient declaration emitted by the package is:
+
+```typescript
+declare global {
+  var core: {
+    // Base
+    loggerService: LoggerService;
+    // Core
+    scraperService: ScraperService;
+    crawlerService: CrawlerService;
+    parserService: ParserService;
+    // DB
+    parserDbService: ParserDbService;
+    screenDbService: ScreenDbService;
+    // Job
+    signalJobService: SignalJobService;
+    // Logic
+    signalLogicService: SignalLogicService;
+    // Screen
+    cryptoYodaScreenService: CryptoYodaScreenService;
+    // Main
+    crawlerMainService: CrawlerMainService;
+    signalMainService: SignalMainService;
+  };
+}
+```
+
+<Note>
+  `core` is populated via `Object.assign(globalThis, { core: ioc })` at module load time. Any file that `import`s (or `require`s) the core package — directly or transitively — will have `core` available on `globalThis` with no further setup.
+</Note>
+
+### Service Descriptions
+
+<CardGroup cols={2}>
+  <Card title="core.loggerService" icon="scroll">
+    Structured logger used throughout the pipeline. Wraps `console`-style output with log-level semantics (`.log`, `.info`, `.warn`, `.error`). All other services hold a reference to this service internally.
+  </Card>
+  <Card title="core.scraperService" icon="satellite-dish">
+    Telegram MTProto message fetcher. Authenticates with the Telegram API and retrieves raw messages from the configured channel(s), delivering them to `crawlerService` for orchestration.
+  </Card>
+  <Card title="core.crawlerService" icon="magnifying-glass">
+    Day/range crawl orchestrator. Coordinates `scraperService` calls over a configurable date window — either a single day or an arbitrary `[from, to]` range — and hands each batch to `parserService`.
+  </Card>
+  <Card title="core.parserService" icon="code">
+    Regex-based field extractor. Receives raw Telegram message strings and produces structured `IParserDto` objects by matching symbol, direction, entry zone, targets, and stop-loss patterns.
+  </Card>
+  <Card title="core.parserDbService" icon="database">
+    CRUD layer for the `parser-items` MongoDB collection. Provides typed methods: `create`, `findAllByVisited`, `findAllByPublishedAt`, `findLast4HourRow`, and `markVisited`, all built on top of `BaseCRUD`.
+  </Card>
+  <Card title="core.screenDbService" icon="database">
+    CRUD layer for the `screen-items` MongoDB collection. Provides typed methods: `create`, `findByParserItem`, and `findLast4HourRow`, built on top of `BaseCRUD`.
+  </Card>
+  <Card title="core.signalJobService" icon="clock">
+    Queued LLM processing job. Enabled automatically at startup (`ioc.signalJobService.enable()`). On each 15-minute crontab tick it fetches all `parser-items` where `visited: false`, runs the Ollama risk evaluation for each one, writes the result to `screen-items`, and marks the parser row as visited.
+  </Card>
+  <Card title="core.signalLogicService" icon="brain">
+    Single-row LLM invocation and field mapping. Called by `signalJobService` for each individual parser row. Invokes `runRiskOutline` and maps the returned `RiskOutlineContract` fields onto an `IScreenDto` ready for database insertion.
+  </Card>
+  <Card title="core.cryptoYodaScreenService" icon="filter">
+    Channel-specific scrape-and-parse service for the CryptoYoda Telegram channel. Combines `scraperService` and `parserService` behaviour with channel-specific message format handling.
+  </Card>
+  <Card title="core.crawlerMainService" icon="arrows-rotate">
+    Live/backtest frame coordinator. Provides a unified interface for running the scrape → parse → store pipeline in either live mode (polling) or historical backtest mode (date-range replay).
+  </Card>
+  <Card title="core.signalMainService" icon="signal">
+    Strategy-facing signal query service. Exposes `getLast4HourSignal` (queries `screen-items`) and `getLast4HourScreen` (queries `parser-items`) — the two entry points most strategy files use.
+  </Card>
+</CardGroup>
+
+### `signalMainService` Method Reference
+
+<ResponseField name="getLast4HourSignal(symbol, when)" type="Promise<IScreenRow | null>">
+  Returns the most recent **screened** signal (from `screen-items`) for the given symbol within the 4-hour window ending at `when`. Returns `null` if no signal exists in that window.
+
+  ```typescript
+  getLast4HourSignal(symbol: string, when: Date): Promise<IScreenRow | null>
+  ```
+
+  This is the primary method for strategy files — the returned `IScreenRow` contains `riskAction` which determines whether to open a position.
+</ResponseField>
+
+<ResponseField name="getLast4HourScreen(symbol, when)" type="Promise<IParserRow | null>">
+  Returns the most recent **parsed but not yet necessarily screened** signal (from `parser-items`) for the given symbol within the 4-hour window ending at `when`. Useful for inspecting the raw signal before LLM evaluation.
+
+  ```typescript
+  getLast4HourScreen(symbol: string, when: Date): Promise<IParserRow | null>
+  ```
+</ResponseField>
+
+### Usage Example
+
+```typescript
+// In your strategy file (loaded via --entry)
+const signal = await core.signalMainService.getLast4HourSignal(symbol, when);
+if (signal?.riskAction === "follow") {
+  // open position
+}
+```
+
+<Tip>
+  `when` should be the current bar's close time, not `new Date()`. In backtest mode `backtest-kit` injects the correct simulated time; in live mode pass the timestamp of the most-recently-closed candle.
+</Tip>
+
+---
+
+## `globalThis.runRiskOutline`
+
+`runRiskOutline` is defined in `packages/core/src/func/risk.function.ts` and registered on `globalThis` at module load time. It provides a standalone way to invoke the Ollama risk filter outside of the normal `signalJobService` queue — for example from a one-off backtest script or an ad-hoc REPL session.
+
+### Signature
+
+```typescript
+interface RiskOutlineParams {
+  symbol: string;
+  publishedAt: Date;
+  exchangeName: string;
+  direction: "short" | "long";
+  targets: number[];
+  stoploss: number;
+}
+
+declare global {
+  var runRiskOutline: (params: RiskOutlineParams) => Promise<RiskOutlineContract>;
+}
+```
+
+### Parameters
+
+<ParamField path="symbol" type="string" required>
+  Trading pair symbol, e.g. `"SOLUSDT"`. Must match a symbol registered in the exchange schema.
+</ParamField>
+
+<ParamField path="publishedAt" type="Date" required>
+  The timestamp of the original Telegram signal. Internally aligned to the nearest 1-minute interval via `alignToInterval(publishedAt, "1m")` before the mock context is created.
+</ParamField>
+
+<ParamField path="exchangeName" type="string" required>
+  The name of the exchange schema registered via `addExchangeSchema`. Used by `backtest-kit` to resolve the correct OHLCV data source for the mock context.
+</ParamField>
+
+<ParamField path="direction" type='"short" | "long"' required>
+  Trade direction extracted from the original signal. Passed directly into the Ollama outline prompt.
+</ParamField>
+
+<ParamField path="targets" type="number[]" required>
+  Array of take-profit price levels from the original signal.
+</ParamField>
+
+<ParamField path="stoploss" type="number" required>
+  Stop-loss price level from the original signal.
+</ParamField>
+
+### Return Value
+
+Returns `Promise<RiskOutlineContract>` — the validated, zod-parsed response from the Ollama LLM:
+
+```typescript
+type RiskOutlineContract = {
+  action: "skip" | "follow";
+  sure_level: "low" | "low_medium" | "medium" | "medium_high" | "high";
+  confidence: "reliable" | "not_reliable";
+  description: string;
+  reasoning: string;
+};
+```
+
+<Warning>
+  If the LLM response fails zod validation, `runRiskOutline` throws an `Error` containing the validation error message. Always wrap calls in a `try/catch` when using this function directly.
+</Warning>
+
+### How It Works
+
+<Steps>
+  <Step title="Align timestamp">
+    Calls `alignToInterval(publishedAt, "1m")` from `backtest-kit` to snap `publishedAt` to the start of its containing 1-minute candle. This becomes the `when` timestamp for the mock context.
+  </Step>
+  <Step title="Open mock context">
+    Calls `runInMockContext(fn, { symbol, exchangeName, when, strategyName: "mock-strategy", frameName: "mock-frame", backtest: true })`. The mock context tells `backtest-kit` to use historical OHLCV data anchored at `when` rather than live market data.
+  </Step>
+  <Step title="Invoke the LLM outline">
+    Inside the context, calls `json<RiskOutlineContract>(OutlineName.RiskOutline, symbol, direction, targets, stoploss)` from `agent-swarm-kit`. The outline prompt is sent to the local Ollama instance.
+  </Step>
+  <Step title="Validate and return">
+    Checks the `isValid` flag on the response. If `false`, throws with the `error` string. If `true`, returns the typed `data` object.
+  </Step>
+</Steps>
+
+### Example
+
+```typescript
+addExchangeSchema({
+  exchangeName: "binance-futures",
+  // ... OHLCV resolver config
+});
+
+const result = await runRiskOutline({
+  symbol: "SOLUSDT",
+  publishedAt: new Date("2024-11-10T09:32:00Z"),
+  exchangeName: "binance-futures",
+  direction: "long",
+  targets: [185, 192, 200],
+  stoploss: 170,
+});
+
+console.log(result.action);       // "follow" | "skip"
+console.log(result.sure_level);   // "low" | ... | "high"
+console.log(result.description);  // human-readable verdict
+```
+
+---
+
+## `globalThis.addExchangeSchema`
+
+`addExchangeSchema` is defined in `packages/core/src/func/exchange.function.ts`. It is a thin wrapper around `addExchangeSchema` from `backtest-kit` and is exposed on `globalThis` so strategy files can register their data source without importing `backtest-kit` directly.
+
+### Signature
+
+```typescript
+declare global {
+  var addExchangeSchema: (schema: IExchangeSchema) => void;
+}
+```
+
+<ParamField path="schema" type="IExchangeSchema" required>
+  An exchange schema object as defined by `backtest-kit`. Registers the OHLCV data resolver that `runRiskOutline` (and `backtest-kit` generally) will use when constructing mock contexts. Refer to the `backtest-kit` documentation for the full `IExchangeSchema` interface.
+</ParamField>
+
+<Warning>
+  `addExchangeSchema` must be called **before** any call to `runRiskOutline`. If no schema is registered for the `exchangeName` passed to `runRiskOutline`, the mock context will fail to resolve candle data and the LLM outline will throw.
+</Warning>
+
+### Example
+
+```typescript
+// strategy.ts — loaded via --entry
+addExchangeSchema({
+  exchangeName: "binance-futures",
+  // IExchangeSchema fields from backtest-kit
+});
+
+// Now runRiskOutline and core.signalJobService can resolve OHLCV for "binance-futures"
+const verdict = await runRiskOutline({
+  symbol: "BTCUSDT",
+  publishedAt: new Date("2024-11-10T14:15:00Z"),
+  exchangeName: "binance-futures",
+  direction: "short",
+  targets: [68000, 65000],
+  stoploss: 72000,
+});
+```
+
+---
+
+## DI Container Internals
+
+The service container is built on `di-kit` (via the `createActivator` factory) and `di-factory` (for the `BaseCRUD` mixin). Understanding the internals is not required for writing strategy files, but is useful when adding new services.
+
+### `inject<T>(symbol)`
+
+Lazily resolves a service by its Symbol token. The service instance is not created until the property is first accessed.
+
+```typescript
+import { inject } from "./lib/core/di";
+import TYPES from "./lib/core/types";
+import LoggerService from "./lib/services/base/LoggerService";
+
+const logger = inject<LoggerService>(TYPES.loggerService);
+// logger is not instantiated yet — it is a lazy proxy
+logger.info("hello"); // instantiation happens here
+```
+
+### `TYPES` — Symbol Registry
+
+All service tokens live in `packages/core/src/lib/core/types.ts`:
+
+```typescript
+export const TYPES = {
+  // Base
+  loggerService: Symbol("loggerService"),
+  // DB
+  parserDbService: Symbol("parserDbService"),
+  screenDbService: Symbol("screenDbService"),
+  // Core
+  scraperService: Symbol("scraperService"),
+  crawlerService: Symbol("crawlerService"),
+  parserService: Symbol("parserService"),
+  // Job
+  signalJobService: Symbol("signalJobService"),
+  // Logic
+  signalLogicService: Symbol("signalLogicService"),
+  // Screen
+  cryptoYodaScreenService: Symbol("cryptoYodaScreenService"),
+  // Main
+  crawlerMainService: Symbol("crawlerMainService"),
+  signalMainService: Symbol("signalMainService"),
+};
+```
+
+### Initialisation Order
+
+<Steps>
+  <Step title="Module load">
+    `packages/core/src/index.ts` is imported. This triggers `src/config/setup`, `src/logic`, `src/func/risk.function`, `src/func/exchange.function`, and `src/lib/index.ts` in order.
+  </Step>
+  <Step title="Provider registration">
+    `lib/core/provide.ts` registers all service constructors against their Symbol tokens with `di-kit`.
+  </Step>
+  <Step title="IoC assembly">
+    `lib/index.ts` calls `inject<T>(TYPES.*)` for every service, producing lazy proxy handles grouped into the `ioc` object.
+  </Step>
+  <Step title="Global assignment">
+    `Object.assign(globalThis, { core: ioc })` makes the container available as `globalThis.core`.
+  </Step>
+  <Step title="Job activation">
+    `ioc.signalJobService.enable()` arms the 15-minute crontab. The job will not fire until the first tick.
+  </Step>
+</Steps>
+
+<Note>
+  `init()` from `di-kit` is called once during `lib/index.ts` load. Calling it a second time is a no-op, so importing the core package from multiple entry points is safe.
+</Note>

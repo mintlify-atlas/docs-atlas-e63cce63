@@ -1,0 +1,237 @@
+---
+title: "Run in Live Mode with 15-Minute Telegram Polling"
+sidebarTitle: "Live Mode"
+description: "Start the live trading pipeline that polls a Telegram channel every 15 minutes, filters signals with Ollama, and opens positions on follow verdicts."
+---
+
+Live mode keeps the pipeline running continuously. A 15-minute cron job polls the configured Telegram channel, pushes new messages through the Ollama LLM risk filter, and feeds the resulting verdicts into the strategy's `getSignal` function. Positions are opened only when the LLM votes `"follow"` **and** the current market price falls inside the channel's published entry zone — the same two-gate logic used in the backtest, now evaluated against live market data.
+
+## Prerequisites
+
+<CardGroup cols={2}>
+  <Card title="Packages built" icon="box">
+    Run `npm run build:x` (macOS/Linux) or `npm run build:win` (Windows). Each
+    workspace package must emit a `build/index.cjs` before the CLI can load the
+    compiled `core` and `main` bundles.
+  </Card>
+  <Card title="session.txt in the strategy folder" icon="telegram">
+    Authenticate once and copy the session file into your strategy directory:
+    ```bash
+    cd ./packages/main && npm run auth
+    cp packages/main/session.txt \
+       content/jan_2026.strategy/session.txt
+    ```
+    The strategy reads this file at runtime to subscribe to the channel without
+    re-authenticating on every start.
+  </Card>
+  <Card title="MongoDB + Redis running" icon="database">
+    `parser-items` (raw Telegram messages) and `screen-items` (LLM verdicts) are
+    both stored in MongoDB. Redis backs the distributed queue and caching layer.
+    Both services must be reachable before `npm start` is invoked.
+  </Card>
+  <Card title="Ollama running with gpt-oss:120b" icon="robot">
+    The risk outline calls the Ollama HTTP API at `CC_OLLAMA_URL`
+    (default `http://localhost:11434`). Pull the model if you have not already:
+    ```bash
+    ollama pull gpt-oss:120b
+    ```
+  </Card>
+</CardGroup>
+
+## Live Mode Command
+
+```bash
+npm start -- --live --entry ./content/jan_2026.strategy/jan_2026.strategy.ts
+```
+
+<Tabs>
+  <Tab title="Flag reference">
+    | Flag | Type | Description |
+    |------|------|-------------|
+    | `--live` | boolean | Activates live mode. `packages/main/src/main/live.ts` checks this flag and exits early if it is absent. |
+    | `--entry` | boolean (presence flag) | Tells `@backtest-kit/cli` to load the path that follows it as the strategy entry point. The file is loaded at runtime and never bundled into the workspace packages. |
+
+    There is no `--cache` flag in live mode — candles are fetched on demand from
+    the exchange as each price tick arrives.
+  </Tab>
+  <Tab title="Environment variables">
+    | Variable | Default | Purpose |
+    |----------|---------|---------|
+    | `CC_MONGO_CONNECTION_STRING` | `mongodb://localhost:27017/backtest-pro?wtimeoutMS=15000` | MongoDB connection |
+    | `CC_TELEGRAM_API_ID` | `31861455` | MTProto API ID |
+    | `CC_TELEGRAM_API_HASH` | `ca60446c67ce250ee4e789c730163449` | MTProto API hash |
+    | `CC_SYMBOL_LIST` | `BTCUSDT,POLUSDT,ZECUSDT,...` | Comma-separated symbols polled on each cron tick |
+    | `CC_OLLAMA_URL` | `http://localhost:11434` | Ollama HTTP endpoint |
+  </Tab>
+</Tabs>
+
+## What Happens Step by Step
+
+<Steps>
+  <Step title="live.ts bootstraps and waits for readiness">
+    `@backtest-kit/cli` resolves `packages/main/src/main/live.ts` and calls
+    `main()`. The function checks that both `--entry` and `--live` flags are
+    present, then calls:
+
+    ```typescript
+    await waitForReady(false);
+    ```
+
+    Passing `false` puts the framework into **live mode**. `waitForReady` blocks
+    until MongoDB, Redis, and the Ollama connection are all healthy.
+  </Step>
+
+  <Step title="Strategy and exchange schemas are resolved">
+    After the infrastructure is ready, the runner reads the schemas registered
+    by the strategy entry file:
+
+    ```typescript
+    const [strategySchema] = await listStrategySchema();
+    const [exchangeSchema] = await listExchangeSchema();
+    ```
+
+    Live mode does not require a frame schema — there is no fixed date range.
+    If either schema is missing the runner throws immediately with a descriptive
+    error.
+  </Step>
+
+  <Step title="Live.background is called for each symbol">
+    A live worker is started for every symbol in `CC_SYMBOL_LIST`:
+
+    ```typescript
+    for (const symbol of CC_SYMBOL_LIST) {
+      Live.background(symbol, {
+        exchangeName: exchangeSchema.exchangeName,
+        strategyName: strategySchema.strategyName,
+      });
+    }
+    ```
+
+    Each worker streams live 1-minute candles from the exchange, calling
+    `getSignal(symbol, when, currentPrice)` on each new close.
+  </Step>
+
+  <Step title="live-fetch-data cron fires every 15 minutes">
+    The strategy registers a recurring `Cron` handler named `"live-fetch-data"`:
+
+    ```typescript
+    Cron.register({
+      name: "live-fetch-data",
+      handler: async (symbol, when, backtest) => {
+        if (backtest) {
+          return;
+        }
+        await core.crawlerMainService.crawlLiveFrame(when);
+      },
+      interval: "15m",
+    });
+    ```
+
+    `interval: "15m"` schedules the handler to fire every 15 minutes across all
+    running symbol workers. `crawlLiveFrame(when)` checks the current mode
+    (skips silently in backtest), then calls `crawlerService.crawlDay(stamp)` to
+    scrape today's messages from the Telegram channel and upsert them into
+    `parser-items`.
+  </Step>
+
+  <Step title="signalJobSubject triggers LLM screening">
+    After each crawl completes, `crawlLiveFrame` emits:
+
+    ```typescript
+    await signalJobSubject.next();
+    ```
+
+    `SignalJobService` wakes up and processes every unvisited row in
+    `parser-items`. For each row it runs the LLM risk outline in a live execution
+    context (using the current wall-clock minute as `when`), producing a
+    structured verdict stored in `screen-items`:
+
+    - `riskAction` — `"follow"` or `"skip"`
+    - `riskSureLevel` — accumulation confidence (`"low"` … `"high"`)
+    - `riskConfidence` — data reliability (`"reliable"` | `"not_reliable"`)
+    - `riskDescription` — 2–3 sentence human-readable verdict
+    - `riskReasoning` — step-by-step rule application log
+
+    Rows are marked `visited` after screening so they are never processed twice.
+  </Step>
+
+  <Step title="getSignal checks the latest verdict on each price tick">
+    On every live price tick `backtest-kit` calls `getSignal`. The function
+    queries the most recent LLM-screened record from `screen-items` for that
+    symbol using a 4-hour look-back window:
+
+    ```typescript
+    const signal = await core.signalMainService.getLast4HourSignal(symbol, when);
+    ```
+
+    Signals with `riskAction === "skip"` are rejected. For surviving signals the
+    function additionally checks that the current 1m close price is between
+    `signal.entryFrom` and `signal.entryTo` before returning a position:
+
+    ```typescript
+    return {
+      id:                  signal.id,
+      position:            signal.direction,    // "long" | "short"
+      priceStopLoss:       signal.stoploss,
+      priceTakeProfit:     signal.targets[2],   // third target (T3)
+      minuteEstimatedTime: Infinity,
+      note:                JSON.stringify(info, null, 2),
+    };
+    ```
+  </Step>
+</Steps>
+
+## Monitoring Active Positions
+
+The strategy registers a `listenActivePing` callback that fires on every tick
+while a position is open. It logs the symbol, open price, take-profit and
+stop-loss levels, peak profit distance, maximum drawdown, and the current
+unrealised PnL:
+
+```typescript
+listenActivePing(async ({ symbol, data, currentPrice }) => {
+  const peakProfitDistance = await getPositionHighestProfitDistancePnlCost(symbol);
+  const peakMaxDrawdown    = await getPositionHighestMaxDrawdownPnlCost(symbol);
+  const currentPnl         = await getPositionPnlCost(symbol);
+  Log.info("position active", {
+    symbol,
+    signalId:    data.id,
+    priceOpen:   data.priceOpen,
+    takeProfit:  data.priceTakeProfit,
+    stopLoss:    data.priceStopLoss,
+    currentPrice,
+    peakProfitDistance,
+    peakMaxDrawdown,
+    currentPnl,
+  });
+});
+```
+
+Strategy-level errors are captured by `listenError` and written to the
+backtest-kit log:
+
+```typescript
+listenError((error) => {
+  console.log(error);
+  Log.debug("error", {
+    error:   errorData(error),
+    message: getErrorMessage(error),
+  });
+});
+```
+
+<Tip>
+  `Log.info()` and `Log.debug()` messages appear both in the terminal output and
+  in the backtest-kit UI (if you add `--ui` to the start command). Use the UI's
+  log panel to monitor signal verdicts, position PnL ticks, and error details
+  without tailing the terminal.
+</Tip>
+
+<Warning>
+  Live mode calls the real exchange API configured in your exchange schema. The
+  default `backtest.module.ts` uses a `ccxt.binance` spot connection. Ensure
+  your exchange schema is pointed at a **paper-trading or sandbox account** before
+  running live with real funds. Order book fetching is explicitly disabled in
+  backtest contexts — implement it according to your exchange's requirements if
+  you need it in live mode.
+</Warning>

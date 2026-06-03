@@ -1,0 +1,123 @@
+---
+title: "backtest-ollama-crontab: LLM-Gated Crypto Signal Backtester"
+sidebarTitle: "Introduction"
+description: "Learn what backtest-ollama-crontab does, why an LLM risk filter improves trade outcomes, and how the TypeScript monorepo is structured."
+---
+
+**backtest-ollama-crontab** is a TypeScript monorepo that wires a free, public Telegram trading-signals channel through a locally-hosted Ollama LLM and into the `backtest-kit` strategy execution engine. Instead of blindly following every signal the channel publishes, the pipeline asks a quantized `gpt-oss` model whether each signal is safe to trade before a position is ever opened. The result is a measurable improvement in January 2026 simulated P&L — from **+52.22% to +68.90%** — achieved by dropping only five trades, four of which were losers.
+
+## What the Project Does
+
+At its core, the repo answers one question: *can a local LLM acting as a rule-based risk filter genuinely improve P&L on historical trading signals?* The experiment takes raw text messages from a Telegram channel, parses entry/target/stop-loss fields out of them, runs each parsed signal through an Ollama inference call, and only opens a position when the model returns `riskAction: "follow"`. Every other piece of infrastructure — candle caching, backtesting replay, live 15-minute polling — exists to support that single gate.
+
+## Two Operating Modes
+
+The same codebase supports two distinct modes controlled by CLI flags:
+
+<Tabs>
+  <Tab title="Backtest Mode">
+    Triggered with `--backtest`. The `backtest-kit` engine replays historical candle data over the full signal set for a given date range. Candles can be pre-fetched with `--cache` so the replay runs offline. The January 2026 strategy file in `content/jan_2026.strategy/` is the reference experiment.
+
+    ```bash
+    npm start -- --backtest --ui --entry ./content/jan_2026.strategy/jan_2026.strategy.ts --cache
+    ```
+  </Tab>
+  <Tab title="Live Mode">
+    Triggered with `--live`. A `Cron.register` handler from `backtest-kit` fires on a **15-minute interval**, re-polling the configured Telegram channel, pushing new signals through the parser and LLM risk filter, and opening live positions when the model agrees.
+
+    ```bash
+    npm start -- --live --entry ./content/jan_2026.strategy/jan_2026.strategy.ts
+    ```
+  </Tab>
+</Tabs>
+
+## The Core Insight: Two Empirical Rules
+
+The LLM is not doing open-ended reasoning. Its system prompt encodes exactly two empirically-derived veto rules:
+
+<CardGroup cols={2}>
+  <Card title="Rule 1 — Sleeping-Coin SHORT Veto" icon="moon">
+    If `direction = SHORT` and `avgRangePct < 0.07%`, the signal is skipped. A low-volatility asset with thin liquidity is a classic stop-hunt target: one large candle sweeps shorts upward before the move reverses.
+  </Card>
+  <Card title="Rule 2 — Knife-Catching LONG Veto" icon="knife">
+    If `direction = LONG` and `momentum24hPct < −1%`, the signal is skipped. Buying into a declining market on a channel signal is catching a falling knife; the stop-loss is almost always triggered before any recovery.
+  </Card>
+</CardGroup>
+
+These rules are embedded in the LLM's system prompt inside `packages/core/src/logic/outline/risk.outline.ts` as plain string constants (`SHORT_MIN_AVG_RANGE_PCT = 0.07`, `LONG_MIN_MOMENTUM_24H_PCT = -1`). They are tunable in one place without recompiling any package.
+
+## January 2026 Results at a Glance
+
+The headline numbers from running the same parsed-signal set with and without the Ollama gate:
+
+| Metric | Without Ollama | With Ollama | Δ |
+|---|---|---|---|
+| Total trades | 22 | 17 | **−5 trades skipped** |
+| Total PnL | +52.22% | **+68.90%** | **+16.68 pp** |
+| Winrate | 68% | **82%** | **+14 pp** |
+| Wins / Losses | 15 / 7 | 14 / 3 | **−4 losing trades** |
+| Sharpe Ratio | +0.309 | **+0.512** | **+0.203** |
+| Profit factor | 2.73 | **6.37** | **+3.64** |
+| Expectancy per trade | +$2.37 | **+$4.05** | **+$1.68** |
+
+The LLM vetoed six signals, four of which were losers totalling **−17.29% avoided**. The two skipped winners cost **−2.47%**. Net filtering win: **+14.82%**, plus one additional trade (`TRX LONG Jan 15 +1.86%`) captured in the filtered run.
+
+## Monorepo Structure
+
+The workspace contains two packages under `packages/` plus strategy files under `content/`:
+
+| Package / Path | Role |
+|---|---|
+| `packages/core` | LLM outline logic, Telegram crawler, signal parser, MongoDB services, DI container — exposes everything on `globalThis.core` |
+| `packages/main` | CLI entrypoints: `backtest`, `live`, `paper`, `session` — reads `globalThis.core` via `inject<T>()` |
+| `content/jan_2026.strategy/` | Reference strategy file loaded at runtime by `@backtest-kit/cli`; never bundled into packages |
+
+<Accordion title="packages/core internals">
+  | Sub-path | Responsibility |
+  |---|---|
+  | `src/lib/services/core/CrawlerService.ts` | Telegram `iterMessages` → `parser-items` upsert |
+  | `src/lib/services/screen/ChannelScreenService.ts` | Regex extraction of `direction / entry / targets / stoploss` |
+  | `src/lib/services/job/SignalJobService.ts` | Subscribes to `signalJobSubject`, fans out each unvisited row to `SignalLogicService` |
+  | `src/logic/outline/risk.outline.ts` | Ollama prompt construction, `commitMetricsHistory`, Zod-validated `riskAction` response |
+  | `src/lib/services/logic/SignalLogicService.ts` | Pure passthrough of LLM verdict to `screen-items` DTO |
+  | `src/schema/Screen.schema.ts` | Final stored fields including `riskAction`, `riskSureLevel`, `riskConfidence`, `riskDescription`, `riskReasoning` |
+</Accordion>
+
+<Accordion title="packages/main entrypoints">
+  | File | Activated by flag |
+  |---|---|
+  | `src/main/backtest.ts` | `--backtest` |
+  | `src/main/live.ts` | `--live` |
+  | `src/main/paper.ts` | `--paper` |
+  | `src/main/session.ts` | `--session` |
+</Accordion>
+
+## Key External Dependencies
+
+| Package | Purpose |
+|---|---|
+| `backtest-kit` | Strategy execution engine, `Cron.register`, `Backtest.background`, `Live.background`, candle APIs |
+| `agent-swarm-kit` | `addOutline`, `ask`, `dumpOutlineResult` — wraps the Ollama inference call |
+| `ollama` | HTTP client for the local Ollama server (default `http://localhost:11434`) |
+| `telegram` (GramJS) | MTProto client for reading Telegram channel messages |
+| `mongoose` | MongoDB ODM for `parser-items` and `screen-items` collections |
+| `ioredis` | Redis client used by `backtest-kit` internals |
+| `di-factory` | Dependency injection container; `inject<T>()` pulls services; all bound on `globalThis.core` |
+| `functools-kit` | Utility helpers including `singleshot` memoization |
+
+---
+
+<CardGroup cols={2}>
+  <Card title="Quickstart" icon="rocket" href="/quickstart">
+    Build the workspace, authenticate Telegram, and run the January 2026 backtest in under 10 minutes.
+  </Card>
+  <Card title="Architecture" icon="diagram-project" href="/architecture">
+    Detailed walkthrough of the five-layer crawl → parse → LLM → strategy → cron pipeline.
+  </Card>
+  <Card title="Risk Outline" icon="shield-halved" href="/concepts/risk-outline">
+    How the LLM prompt is constructed, what metrics are fed in, and how the Zod schema validates the response.
+  </Card>
+  <Card title="Backtest Report" icon="chart-line" href="/results/backtest-report">
+    Full January 2026 trade-by-trade log comparing the baseline run against the Ollama-gated run.
+  </Card>
+</CardGroup>

@@ -1,0 +1,241 @@
+---
+title: "Stock Data Advisors: 1m and 15m Candle Context Providers"
+sidebarTitle: "Advisors"
+description: "Reference for StockData1mAdvisor and StockData15mAdvisor, the agent-swarm-kit advisors that format OHLCV candle data as markdown tables for the LLM."
+---
+
+The pipeline registers two `agent-swarm-kit` advisors whose sole purpose is to convert raw OHLCV candle data into a markdown table the LLM can read directly inside the outline history. `StockData1mAdvisor` provides 4 hours of 1-minute candles (240 rows) and `StockData15mAdvisor` provides 8 hours of 15-minute candles (32 rows). Neither advisor makes any decision — they are pure data formatters. The LLM uses the tables exclusively to populate the audit fields `sure_level` and `confidence`; the `action` decision is driven entirely by the pre-computed scalar metrics injected by `commitMetricsHistory`.
+
+## AdvisorName Enum
+
+```typescript
+// src/enum/AdvisorName.ts
+export enum AdvisorName {
+    StockData15mAdvisor = "stock_data_15m_advisor",
+    StockData1mAdvisor  = "stock_data_1m_advisor",
+}
+```
+
+## How Advisors Are Called in the Outline
+
+Both advisors are invoked via `ask()` from `agent-swarm-kit` inside `risk.outline.ts`. `ask` resolves the advisor by name, calls its `getChat` function with the symbol, and returns the resulting markdown string.
+
+```typescript
+// Inside commitOneMinuteHistory:
+const report = await ask(symbol, AdvisorName.StockData1mAdvisor);
+
+// Inside commitFifteenMinuteHistory:
+const report = await ask(symbol, AdvisorName.StockData15mAdvisor);
+```
+
+The returned string is then pushed as a user message in the outline history, followed by an assistant `"OK"` acknowledgement, so the LLM has already "read" both tables before it encounters the draft signal or the final instruction.
+
+<Note>
+  `ask()` throws if the advisor returns a falsy value. Both `commitOneMinuteHistory` and `commitFifteenMinuteHistory` check for this and throw `"StockData1mAdvisor failed"` / `"StockData15mAdvisor failed"` respectively, causing the outline to abort and retry from the outer error handler.
+</Note>
+
+---
+
+## StockData1mAdvisor
+
+`StockData1mAdvisor` fetches the most recent 240 one-minute candles and formats them as a markdown table.
+
+### Registration
+
+```typescript
+import { addAdvisor } from "agent-swarm-kit";
+import { AdvisorName } from "../../enum/AdvisorName";
+import { getCandles } from "backtest-kit";
+import dayjs from "dayjs";
+
+const CANDLES_LIMIT = 240; // 240 × 1m = 4 hours of history
+
+addAdvisor({
+  advisorName: AdvisorName.StockData1mAdvisor,
+  getChat: async (symbol: string) => {
+    const candles = await getCandles(symbol, "1m", CANDLES_LIMIT);
+    // ... format as markdown table
+  },
+});
+```
+
+<CardGroup cols={2}>
+  <Card title="advisorName" icon="tag">
+    `AdvisorName.StockData1mAdvisor` = `"stock_data_1m_advisor"`
+  </Card>
+  <Card title="CANDLES_LIMIT" icon="clock">
+    **240** — 4 hours of 1-minute candles
+  </Card>
+</CardGroup>
+
+### `getChat(symbol)` — Column Calculations
+
+The function calls `getCandles(symbol, "1m", 240)` from `backtest-kit`, then iterates over each candle to compute three derived columns:
+
+<ResponseField name="Change %" type="number">
+  `(close - open) / open × 100` — signed percentage move of the candle body relative to the open price. Formatted to **3** decimal places.
+</ResponseField>
+
+<ResponseField name="Volatility %" type="number">
+  `(high - low) / close × 100` — candle range as a percentage of the close price. Formatted to **2** decimal places.
+</ResponseField>
+
+<ResponseField name="Body %" type="number">
+  `|close - open| / (high - low) × 100` — proportion of the range covered by the candle body (0 % = pure wick doji, 100 % = marubozu). Returns `0` when `high == low`. Formatted to **1** decimal place.
+</ResponseField>
+
+**Number precision:**
+- OHLC prices: **8** decimal places (`toFixed(8)`)
+- Volume: **4** decimal places (`toFixed(4)`)
+- Time: `dayjs.utc(timestamp).format("YYYY-MM-DD HH:mm") + " UTC"`
+
+---
+
+## StockData15mAdvisor
+
+`StockData15mAdvisor` is structurally identical to `StockData1mAdvisor` but operates on the 15-minute timeframe.
+
+### Registration
+
+```typescript
+const CANDLES_LIMIT = 32; // 32 × 15m = 8 hours of history
+
+addAdvisor({
+  advisorName: AdvisorName.StockData15mAdvisor,
+  getChat: async (symbol: string) => {
+    const candles = await getCandles(symbol, "15m", CANDLES_LIMIT);
+    // ... identical markdown table format
+  },
+});
+```
+
+<CardGroup cols={2}>
+  <Card title="advisorName" icon="tag">
+    `AdvisorName.StockData15mAdvisor` = `"stock_data_15m_advisor"`
+  </Card>
+  <Card title="CANDLES_LIMIT" icon="clock">
+    **32** — 8 hours of 15-minute candles
+  </Card>
+</CardGroup>
+
+The derived columns (`Change %`, `Volatility %`, `Body %`) and number formatting rules are identical to the 1m advisor.
+
+---
+
+## Markdown Table Format
+
+Both advisors produce a table in the following shape. The header line and separator are fixed; row content varies by candle data.
+
+```markdown
+## 1-Minute Candles (Last 240)
+> Symbol: BTCUSDT
+
+| # | Time | Open | High | Low | Close | Volume | Change % | Volatility % | Body % |
+|---|------|------|------|-----|-------|--------|----------|--------------|--------|
+| 1 | 2024-11-15 10:00 UTC | 91234.50000000 | 91450.00000000 | 91100.00000000 | 91380.00000000 | 142.3400 | 0.160% | 0.38% | 78.9% |
+| 2 | 2024-11-15 10:01 UTC | 91380.00000000 | 91400.00000000 | 91250.00000000 | 91260.00000000 | 98.7200 | -0.131% | 0.16% | 82.1% |
+| 3 | 2024-11-15 10:02 UTC | 91260.00000000 | 91310.00000000 | 91210.00000000 | 91310.00000000 | 54.1100 | 0.055% | 0.11% | 50.0% |
+...
+| 240 | 2024-11-15 14:00 UTC | 92100.00000000 | 92200.00000000 | 92050.00000000 | 92180.00000000 | 201.5500 | 0.087% | 0.16% | 86.7% |
+```
+
+For the 15-minute advisor the heading changes to `## 15-Minute Candles (Last 32)` and the `Symbol:` line and table structure remain identical.
+
+<Tip>
+  The 8-decimal-place price formatting is intentional for low-priced altcoins (e.g. `0.00003421 USD`) where fewer decimal places would lose significant precision. The LLM reads the raw string values; no rounding is applied beyond `toFixed`.
+</Tip>
+
+---
+
+## Advisor vs. Metrics: What the LLM Uses for What
+
+Understanding the separation between advisor data and pre-computed metrics is critical for interpreting LLM output correctly.
+
+<CardGroup cols={2}>
+  <Card title="Advisor data (candles)" icon="table">
+    **Used for:** `sure_level` and `confidence` audit fields only.
+
+    The LLM inspects the 1m and 15m tables to assess whether there is visual evidence of accumulation, manipulation, or anomalous volume patterns. This assessment is logged for post-analysis but does **not** influence `action`.
+  </Card>
+  <Card title="Pre-computed metrics" icon="calculator">
+    **Used for:** `action` decision exclusively.
+
+    `avgRangePct` and `momentum24hPct` are derived from 1440 1m candles in `commitMetricsHistory` and pushed as scalar numbers. The LLM is instructed to apply the two rules literally against these numbers and not to re-derive them from the candle tables.
+  </Card>
+</CardGroup>
+
+<Warning>
+  Never remove or reorder advisor calls in `getOutlineHistory`. If `commitOneMinuteHistory` or `commitFifteenMinuteHistory` is skipped, the LLM will not have candle context and will be forced to assign `confidence: "not_reliable"` on every call, degrading the quality of the audit log even though `action` would remain correct.
+</Warning>
+
+---
+
+## Full `getChat` Source — StockData1mAdvisor
+
+```typescript
+getChat: async (symbol: string) => {
+  console.log(`${AdvisorName.StockData1mAdvisor} called symbol=${symbol}`);
+
+  const candles = await getCandles(symbol, "1m", CANDLES_LIMIT);
+
+  let markdown = `## 1-Minute Candles (Last ${CANDLES_LIMIT})\n`;
+  markdown += `> Symbol: ${String(symbol).toUpperCase()}\n\n`;
+  markdown += `| # | Time | Open | High | Low | Close | Volume | Change % | Volatility % | Body % |\n`;
+  markdown += `|---|------|------|------|-----|-------|--------|----------|--------------|--------|\n`;
+
+  for (let i = 0; i < candles.length; i++) {
+    const c = candles[i];
+    const volatility = ((c.high - c.low) / c.close) * 100;
+    const bodySize = Math.abs(c.close - c.open);
+    const range = c.high - c.low;
+    const bodyPct = range > 0 ? (bodySize / range) * 100 : 0;
+    const changePct = c.open > 0 ? ((c.close - c.open) / c.open) * 100 : 0;
+    const time = dayjs.utc(c.timestamp).format("YYYY-MM-DD HH:mm") + " UTC";
+
+    const open   = Number(c.open).toFixed(8);
+    const high   = Number(c.high).toFixed(8);
+    const low    = Number(c.low).toFixed(8);
+    const close  = Number(c.close).toFixed(8);
+    const volume = Number(c.volume).toFixed(4);
+
+    markdown += `| ${i + 1} | ${time} | ${open} | ${high} | ${low} | ${close} | ${volume} | ${changePct.toFixed(3)}% | ${volatility.toFixed(2)}% | ${bodyPct.toFixed(1)}% |\n`;
+  }
+
+  return markdown;
+},
+```
+
+## Full `getChat` Source — StockData15mAdvisor
+
+```typescript
+getChat: async (symbol: string) => {
+  console.log(`${AdvisorName.StockData15mAdvisor} called symbol=${symbol}`);
+
+  const candles = await getCandles(symbol, "15m", CANDLES_LIMIT);
+
+  let markdown = `## 15-Minute Candles (Last ${CANDLES_LIMIT})\n`;
+  markdown += `> Symbol: ${String(symbol).toUpperCase()}\n\n`;
+  markdown += `| # | Time | Open | High | Low | Close | Volume | Change % | Volatility % | Body % |\n`;
+  markdown += `|---|------|------|------|-----|-------|--------|----------|--------------|--------|\n`;
+
+  for (let i = 0; i < candles.length; i++) {
+    const c = candles[i];
+    const volatility = ((c.high - c.low) / c.close) * 100;
+    const bodySize = Math.abs(c.close - c.open);
+    const range = c.high - c.low;
+    const bodyPct = range > 0 ? (bodySize / range) * 100 : 0;
+    const changePct = c.open > 0 ? ((c.close - c.open) / c.open) * 100 : 0;
+    const time = dayjs.utc(c.timestamp).format("YYYY-MM-DD HH:mm") + " UTC";
+
+    const open   = Number(c.open).toFixed(8);
+    const high   = Number(c.high).toFixed(8);
+    const low    = Number(c.low).toFixed(8);
+    const close  = Number(c.close).toFixed(8);
+    const volume = Number(c.volume).toFixed(4);
+
+    markdown += `| ${i + 1} | ${time} | ${open} | ${high} | ${low} | ${close} | ${volume} | ${changePct.toFixed(3)}% | ${volatility.toFixed(2)}% | ${bodyPct.toFixed(1)}% |\n`;
+  }
+
+  return markdown;
+},
+```

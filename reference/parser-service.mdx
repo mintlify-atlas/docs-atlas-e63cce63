@@ -1,0 +1,357 @@
+---
+title: "ParserService: Regex-Based Signal Field Extraction"
+sidebarTitle: "ParserService"
+description: "API reference for ParserService, which applies configurable regex patterns to raw Telegram messages to extract structured trading signal fields."
+---
+
+`ParserService` is the generic field-extraction engine at the heart of the pipeline's ingestion layer. It receives raw `ScraperMessage` objects — plain text scraped from a Telegram channel — together with a typed `FieldMapping` that describes how each field should be extracted, transformed, and validated using regular expressions. The result is a `ParserMessageBase` array where each entry either carries a fully structured `data` object or `null` when the message did not match the expected signal format. Because `ParserService` is format-agnostic, the same engine powers every channel-specific screen service; `CryptoYodaScreenService` passes its own `SIGNAL_FORMAT` map while future channels need only supply a different format object.
+
+---
+
+## ParserService
+
+`ParserService` is registered under `TYPES.parserService` in the DI container.
+
+```typescript
+import { ParserService } from "@core/lib/services/core/ParserService";
+// const parserService = inject<ParserService>(TYPES.parserService);
+```
+
+### Methods
+
+#### `parseDay`
+
+Processes a list of scraped messages against a field-mapping format and returns augmented message objects.
+
+```typescript
+public parseDay<M extends FieldMapping>(
+  messages: ScraperMessage[],
+  format: M
+): Promise<ParserMessageBase<M>[]>
+```
+
+<ParamField path="messages" type="ScraperMessage[]" required>
+  Raw messages from `ScraperService.scrapeDay`. Each item must provide:
+  - `id: number` — Telegram message ID
+  - `channel: string` — source channel identifier
+  - `content: string` — raw message text to parse
+  - `date: Date` — original publication timestamp
+</ParamField>
+
+<ParamField path="format" type="M extends FieldMapping" required>
+  A `FieldMapping` record mapping field names to either a bare `RegExp` or a
+  full `ExtractConfig<T>` descriptor. Every key in `format` becomes a key in
+  the returned `data` object. See [FieldMapping and ExtractConfig](#fieldmapping-and-extractconfig) below.
+</ParamField>
+
+<ResponseField name="ParserMessageBase<M>[]" type="array">
+  One entry per input message. Each entry extends `ScraperMessage` with an
+  additional `data` field:
+  - `data: ExtractedData<M>` — all fields successfully extracted
+  - `data: null` — at least one required field failed to match or validate
+</ResponseField>
+
+**Processing steps per message:**
+
+<Steps>
+  <Step title="Normalize the spec">
+    Each `format` entry is coerced from `RegExp | ExtractConfig` to a full
+    `ExtractConfig` object via the internal `TO_CONFIG_FN` helper. A bare
+    `RegExp` becomes `{ pattern }` with all other options defaulting.
+  </Step>
+  <Step title="Extract each field">
+    `EXTRACT_DATA_FN(msg.content, format)` is called. For each key in
+    `format`:
+    - **Single field** (`multi` absent or `false`): runs
+      `text.match(cfg.pattern)`, reads `match[cfg.group ?? 1]`, applies
+      `transform`, checks `validate`. Returns `null` for the whole message if
+      the match fails and `optional` is not set.
+    - **Multi field** (`multi: true`, pattern must be global): runs
+      `text.matchAll(cfg.pattern)`, maps each match through `transform`,
+      validates every value. Returns `null` if no matches and `optional` is
+      not set.
+    - **Optional field** (`optional: true`): if no match is found the key is
+      simply omitted from the result object instead of aborting.
+  </Step>
+  <Step title="Log the preview">
+    Each message content is truncated to 64 characters, newlines replaced with
+    spaces, and logged alongside the extracted result for debugging.
+  </Step>
+  <Step title="Accumulate and return">
+    Each `{ ...msg, data }` is pushed to the result array. Messages with
+    `data: null` are retained in the array so callers can observe the failure
+    rate.
+  </Step>
+</Steps>
+
+---
+
+## Type Reference
+
+### `ExtractConfig<T>`
+
+Defined in `model/ParseFormat.model.ts`. Describes how a single field is extracted from raw text.
+
+```typescript
+export type ExtractConfig<T = string> = {
+  pattern:    RegExp;
+  group?:     number;
+  transform?: (raw: string, match: RegExpMatchArray) => T;
+  validate?:  (value: T) => boolean;
+  multi?:     boolean;
+  optional?:  boolean;
+};
+```
+
+<ResponseField name="pattern" type="RegExp" required>
+  The regular expression to match against the message text. Must include the
+  `g` flag when `multi: true`.
+</ResponseField>
+
+<ResponseField name="group" type="number">
+  Capture group index to read from the match array. Defaults to `1`. Use `0`
+  to read the full match string.
+</ResponseField>
+
+<ResponseField name="transform" type="(raw: string, match: RegExpMatchArray) => T">
+  Optional mapping function applied to the raw captured string before
+  validation and storage. Receives both the raw string and the full match
+  array so complex shapes (e.g. `{ from, to }` objects) can be constructed
+  from multiple groups.
+</ResponseField>
+
+<ResponseField name="validate" type="(value: T) => boolean">
+  Optional predicate run after `transform`. Returning `false` causes the
+  entire message to parse as `null` (unless `optional: true`).
+</ResponseField>
+
+<ResponseField name="multi" type="boolean">
+  When `true`, `text.matchAll(pattern)` is used instead of `text.match`. The
+  field value becomes an array of transformed matches. The `pattern` **must**
+  have the `g` flag; the parser throws otherwise.
+</ResponseField>
+
+<ResponseField name="optional" type="boolean">
+  When `true`, a missing match does not abort extraction. The key is omitted
+  from the result object rather than returning `null` for the whole message.
+</ResponseField>
+
+---
+
+### `FieldMapping`
+
+```typescript
+export type FieldMapping = {
+  [key: string]: RegExp | ExtractConfig<any>;
+};
+```
+
+A plain record type. Keys become the property names in the extracted data object. Values are either a shorthand `RegExp` (equivalent to `{ pattern: rx }`) or a full `ExtractConfig`.
+
+---
+
+### `ParseFormat<T>`
+
+A stricter variant of `FieldMapping` that binds each key's config type to the corresponding value type in `T`. Used when you want TypeScript to enforce that your `ExtractConfig` transforms produce the right output type.
+
+```typescript
+export type ParseFormat<T> = {
+  [K in keyof T]: RegExp | ExtractConfig<T[K] extends (infer U)[] ? U : T[K]>;
+};
+```
+
+---
+
+### `ExtractedData<M>`
+
+The mapped output type inferred from a `FieldMapping`. `multi: true` fields become arrays.
+
+```typescript
+export type ExtractedData<M extends FieldMapping> = {
+  [K in keyof M]: M[K] extends ExtractConfig<infer R>
+    ? M[K] extends { multi: true }
+      ? R[]
+      : R
+    : M[K] extends RegExp
+      ? string
+      : never;
+};
+```
+
+---
+
+### `ScraperMessage`
+
+Defined in `model/ScraperMessage.model.ts`. The raw input type for `parseDay`.
+
+```typescript
+export interface ScraperMessage {
+  id:      number;   // Telegram message ID
+  channel: string;   // Channel identifier string
+  content: string;   // Full raw message text
+  date:    Date;     // UTC publication timestamp
+}
+```
+
+---
+
+### `ParserMessageBase<M>`
+
+Defined in `model/ParserMessage.model.ts`. The output type of `parseDay`.
+
+```typescript
+export interface ParserMessageBase<M extends FieldMapping> extends ScraperMessage {
+  data: ExtractedData<M> | null;
+}
+```
+
+The `ParserMessage<M, T>` variant additionally carries a `type: T` discriminant string, used by channel screen services to tag messages with their source channel:
+
+```typescript
+export interface ParserMessage<M extends FieldMapping, T extends string>
+  extends ParserMessageBase<M> {
+  type: T;
+}
+```
+
+---
+
+## Practical Example: Defining a Format for a New Channel
+
+Below is a self-contained example showing how to define a `ParseFormat` for a hypothetical new signal channel, mirroring the structure used by `CryptoYodaScreenService`'s `SIGNAL_FORMAT`.
+
+<CodeGroup>
+
+```typescript New channel format definition
+import { ParseFormat } from "@core/model/ParseFormat.model";
+
+// 1. Define the shape of the extracted data
+type MySignalFields = {
+  coin:      string;
+  side:      "buy" | "sell";
+  targets:   number[];
+  stopLoss:  number;
+};
+
+const num = (s: string) => parseFloat(s.replace(",", "."));
+const isNum = (v: number) => Number.isFinite(v) && v > 0;
+
+// 2. Create the format map
+const MY_SIGNAL_FORMAT: ParseFormat<MySignalFields> = {
+  coin: {
+    pattern:  /\$([A-Z0-9]+)/,
+    group:    1,
+    validate: (v) => v.length >= 2,
+  },
+
+  side: {
+    pattern:   /\b(BUY|SELL)\b/i,
+    transform: (raw) => raw.toLowerCase() as "buy" | "sell",
+    validate:  (v) => v === "buy" || v === "sell",
+  },
+
+  // multi: true → returns number[]
+  targets: {
+    pattern:   /TP\s*\d*:\s*([\d.,]+)/gi,   // must be global
+    transform: (_, m) => num(m[1]),
+    validate:  (v) => isNum(v),
+    multi:     true,
+  },
+
+  stopLoss: {
+    pattern:   /SL:\s*([\d.,]+)/i,
+    transform: (_, m) => num(m[1]),
+    validate:  (v) => isNum(v),
+  },
+};
+```
+
+```typescript Using the format with ParserService
+import { inject } from "@core/lib/core/di";
+import ParserService from "@core/lib/services/core/ParserService";
+import TYPES from "@core/lib/core/types";
+
+const parserService = inject<ParserService>(TYPES.parserService);
+
+const messages = await scraperService.scrapeDay("my_channel", new Date());
+const parsed   = await parserService.parseDay(messages, MY_SIGNAL_FORMAT);
+
+for (const msg of parsed) {
+  if (!msg.data) {
+    console.log("Failed to parse:", msg.id);
+    continue;
+  }
+  console.log(msg.data.coin, msg.data.side, msg.data.targets);
+}
+```
+
+```typescript SIGNAL_FORMAT reference (CryptoYodaScreenService)
+// The production format used for crypto_yoda_channel
+const SIGNAL_FORMAT: ParseFormat<SignalFields> = {
+  symbol: {
+    pattern:  /#([A-Z0-9]+)\/USDT/,
+    group:    1,
+    validate: (v) => v.length > 0,
+  },
+  direction: {
+    pattern:   /(ШОРТ|ЛОНГ)/i,
+    transform: (raw) => (raw.toUpperCase() === "ШОРТ" ? "short" : "long"),
+    validate:  (v) => v === "short" || v === "long",
+  },
+  entry: {
+    pattern: /зоне\s+\$?([\d.,]+)\s*[-–—]\s*(?:\$?[\d.,]+\s*[-–—]\s*)?\$?([\d.,]+)(?=\s)/i,
+    transform: (_, m) => ({ from: num(m[1]), to: num(m[2]) }),
+    validate:  (v) => isNum(v.from) && isNum(v.to) && v.from < v.to,
+  },
+  targets: {
+    pattern:   /Закрыть(?:\s+ордер)?\s+по(?:\s+цене)?\s+\$?([\d.,]+)/gi,
+    transform: (_, m) => num(m[1]),
+    validate:  (v) => isNum(v),
+    multi:     true,
+  },
+  stoploss: {
+    pattern:   /СТОП-?ЛОСС:\s*\$?([\d.,]+)/i,
+    transform: (_, m) => num(m[1]),
+    validate:  (v) => isNum(v),
+  },
+};
+```
+
+</CodeGroup>
+
+<Warning>
+  If `multi: true` is set on a field but the `RegExp` does not have the `g`
+  flag, `ParserService` throws:
+  ```
+  parserService field "targets" is multi but pattern is not global
+  ```
+  Always pair `multi: true` with a global regex.
+</Warning>
+
+<Tip>
+  Use `optional: true` for fields that are present only in some message
+  variants. The field will be absent from `data` when not matched, rather than
+  making the entire `data` value `null`.
+</Tip>
+
+---
+
+## Error Handling
+
+`EXTRACT_DATA_FN` returns `null` — not throws — when a required field fails to match or validate. The `parseDay` wrapper catches no errors; any exception propagates up. The only explicit throw in the parser is the `multi + non-global` pattern guard.
+
+```typescript
+// Safe pattern: always check data before use
+const parsed = await parserService.parseDay(messages, MY_FORMAT);
+const valid  = parsed.filter((m) => m.data !== null);
+```
+
+<CardGroup cols={2}>
+  <Card title="CrawlerService" icon="spider" href="/reference/crawler-service">
+    Orchestrates `screenDay` calls and upserts parsed messages to
+    `parser-items`.
+  </Card>
+  <Card title="SignalJobService" icon="bolt" href="/reference/signal-job-service">
+    Consumes `parser-items` rows and pipes them through the LLM risk outline.
+  </Card>
+</CardGroup>

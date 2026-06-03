@@ -1,0 +1,368 @@
+---
+title: "SignalLogicService: LLM Outline Execution and DTO Mapping"
+sidebarTitle: "SignalLogicService"
+description: "API reference for SignalLogicService, which runs the RiskOutline against a parser-items row and maps the LLM response into a screen-items DTO."
+---
+
+`SignalLogicService` is the thin but critical layer that converts a structured `IParserRow` — a previously parsed Telegram trading signal stored in `parser-items` — into a fully enriched `IScreenDto` ready for `screen-items` storage. It does this by invoking the `RiskOutline` agent from `agent-swarm-kit` with the signal's key parameters (symbol, direction, targets, stoploss) and merging the LLM's risk assessment fields onto the passthrough signal fields. The service itself contains no prompt logic; that lives inside the outline definition. `SignalLogicService` is only responsible for calling the outline, validating the response, and assembling the final DTO.
+
+---
+
+## SignalLogicService
+
+`SignalLogicService` is registered under `TYPES.signalLogicService` in the DI container and is accessible as `core.signalLogicService`.
+
+```typescript
+import { SignalLogicService } from "@core/lib/services/logic/SignalLogicService";
+// const signalLogicService = inject<SignalLogicService>(TYPES.signalLogicService);
+```
+
+---
+
+### `execute(row: IParserRow): Promise<IScreenDto>`
+
+The sole public method. Runs the `RiskOutline` LLM outline against the given parser row and returns a complete screen DTO.
+
+```typescript
+public execute = async (row: IParserRow): Promise<IScreenDto>
+```
+
+<ParamField path="row" type="IParserRow" required>
+  A document from the `parser-items` MongoDB collection. Must carry all signal
+  fields populated by `CrawlerService`. Key properties consumed by this method:
+
+  | Field | Type | Description |
+  |---|---|---|
+  | `id` | `string` | MongoDB `_id` (used as `parserItemId` in the DTO) |
+  | `channel` | `string` | Source channel identifier, e.g. `"crypto_yoda_channel"` |
+  | `source` | `string` | Origin source string (same as `channel` for Telegram) |
+  | `publishedAt` | `Date` | Original Telegram message timestamp |
+  | `symbol` | `string` | Trading pair symbol, e.g. `"BTCUSDT"` |
+  | `direction` | `"long" \| "short"` | Trade direction |
+  | `entry` | `{ from: number; to: number }` | Entry price zone |
+  | `targets` | `number[]` | Ordered take-profit price levels |
+  | `stoploss` | `number` | Stop-loss price level |
+  | `note` | `string` | Raw message text stored as a note |
+  | `content` | `unknown` | Full parsed signal data (Mixed) |
+</ParamField>
+
+**Throws** `Error` if the LLM outline returns `isValid: false`. The error message is the `error` string from the outline response.
+
+---
+
+#### Return value: `IScreenDto`
+
+<ResponseField name="parserItemId" type="string">
+  The `id` of the source `parser-items` row. Used as the unique key in the
+  `screen-items` collection (`{ parserItemId: 1 }` unique index).
+</ResponseField>
+
+<ResponseField name="channel" type="string">
+  Passed through from `row.channel`.
+</ResponseField>
+
+<ResponseField name="source" type="string">
+  Passed through from `row.source`.
+</ResponseField>
+
+<ResponseField name="publishedAt" type="Date">
+  Passed through from `row.publishedAt`.
+</ResponseField>
+
+<ResponseField name="symbol" type="string">
+  Passed through from `row.symbol` (e.g. `"ETHUSDT"`).
+</ResponseField>
+
+<ResponseField name="direction" type='"long" | "short"'>
+  Passed through from `row.direction`.
+</ResponseField>
+
+<ResponseField name="entryFrom" type="number">
+  Flattened from `row.entry.from` — the lower bound of the entry price zone.
+</ResponseField>
+
+<ResponseField name="entryTo" type="number">
+  Flattened from `row.entry.to` — the upper bound of the entry price zone.
+</ResponseField>
+
+<ResponseField name="targets" type="number[]">
+  Passed through from `row.targets`.
+</ResponseField>
+
+<ResponseField name="stoploss" type="number">
+  Passed through from `row.stoploss`.
+</ResponseField>
+
+<ResponseField name="riskSureLevel" type='"low" | "low_medium" | "medium" | "medium_high" | "high"'>
+  Mapped from `outline.sure_level`. Indicates the LLM's confidence that market
+  manipulation (candle anomalies, volume accumulation) is present.
+
+  | Value | Meaning |
+  |---|---|
+  | `low` | No signs of manipulation; organic volume structure |
+  | `low_medium` | One recent anomaly without price displacement |
+  | `medium` | One older anomaly or one with price displacement |
+  | `medium_high` | Recurring accumulation pattern |
+  | `high` | Multiple accumulation events with clear price displacement |
+</ResponseField>
+
+<ResponseField name="riskConfidence" type='"reliable" | "not_reliable"'>
+  Mapped from `outline.confidence`. Indicates data quality for the assessment.
+
+  | Value | Meaning |
+  |---|---|
+  | `reliable` | Data is unambiguous |
+  | `not_reliable` | Data is contradictory, weak, or missing |
+</ResponseField>
+
+<ResponseField name="riskAction" type='"skip" | "follow"'>
+  Mapped from `outline.action`. The LLM's trade recommendation.
+
+  | Value | Meaning |
+  |---|---|
+  | `follow` | Open a position in the signal's direction |
+  | `skip` | Do not open a position |
+</ResponseField>
+
+<ResponseField name="riskDescription" type="string">
+  Mapped from `outline.description`. A 2–3 sentence human-readable summary of
+  the action decision, naming the applied rule and key figures. Example:
+  `"Action skip. SHORT on a dormant asset (avgRangePct 0.045% < 0.07%) — stop-hunt target. Sure_level high, confidence reliable."`
+</ResponseField>
+
+<ResponseField name="riskReasoning" type="string">
+  Mapped from `outline.reasoning`. A detailed step-by-step reasoning trace
+  (single string, newline-separated steps):
+  1. Raw metric values used
+  2. Applied rule → action decision
+  3. `sure_level` and `confidence` justification
+</ResponseField>
+
+<ResponseField name="note" type="string">
+  Passed through from `row.note` (the raw Telegram message text).
+</ResponseField>
+
+<ResponseField name="content" type="unknown">
+  Passed through from `row.content` (the full parsed data object stored as
+  Mixed).
+</ResponseField>
+
+---
+
+## Full `execute` Implementation
+
+```typescript
+import { inject }        from "@core/lib/core/di";
+import { IParserRow }    from "@core/schema/Parser.schema";
+import { IScreenDto }    from "@core/schema/Screen.schema";
+import LoggerService     from "@core/lib/services/base/LoggerService";
+import TYPES             from "@core/lib/core/types";
+import { json }          from "agent-swarm-kit";
+import OutlineName       from "@core/enum/OutlineName";
+import { RiskOutlineContract } from "@core/contract/RiskOutline";
+
+type Symbol    = string;
+type Direction = "short" | "long";
+type Targets   = number[];
+type StopLoss  = number;
+
+type Args = [Symbol, Direction, Targets, StopLoss];
+
+const RUN_OUTLINE_FN = async (row: IParserRow) => {
+  const { data, error, isValid } = await json<RiskOutlineContract, Args>(
+    OutlineName.RiskOutline,   // "risk_outline"
+    row.symbol,
+    row.direction,
+    row.targets,
+    row.stoploss,
+  );
+
+  if (!isValid) {
+    throw new Error(error);
+  }
+
+  return data;
+};
+
+export class SignalLogicService {
+  readonly loggerService = inject<LoggerService>(TYPES.loggerService);
+
+  public execute = async (row: IParserRow): Promise<IScreenDto> => {
+    this.loggerService.log("signalLogicService execute", { rowId: row.id });
+
+    const outline = await RUN_OUTLINE_FN(row);
+
+    return {
+      // ── Passthrough fields ──────────────────────────────────────────────
+      parserItemId: row.id,
+      channel:      row.channel,
+      source:       row.source,
+      publishedAt:  row.publishedAt,
+      symbol:       row.symbol,
+      direction:    row.direction,
+      targets:      row.targets,
+      stoploss:     row.stoploss,
+      note:         row.note,
+      content:      row.content,
+
+      // ── Flattened entry zone ─────────────────────────────────────────────
+      entryFrom: row.entry.from,
+      entryTo:   row.entry.to,
+
+      // ── LLM risk assessment ──────────────────────────────────────────────
+      riskSureLevel:   outline.sure_level,
+      riskConfidence:  outline.confidence,
+      riskAction:      outline.action,
+      riskDescription: outline.description,
+      riskReasoning:   outline.reasoning,
+    };
+  };
+}
+```
+
+---
+
+## `json()` from `agent-swarm-kit`
+
+`RUN_OUTLINE_FN` uses the `json<T, Args>()` helper to invoke a named outline by its string identifier.
+
+```typescript
+const { data, error, isValid } = await json<RiskOutlineContract, Args>(
+  outlineName: string,
+  ...args: Args
+): Promise<{ data: T | null; error: string | null; isValid: boolean }>
+```
+
+<ParamField path="outlineName" type="string" required>
+  The registered outline identifier. For the risk filter this is
+  `OutlineName.RiskOutline` which resolves to the string `"risk_outline"`.
+</ParamField>
+
+<ParamField path="...args" type="Args tuple" required>
+  Positional arguments forwarded to the outline, typed as
+  `[Symbol, Direction, Targets, StopLoss]`:
+  - `row.symbol` — e.g. `"BTCUSDT"`
+  - `row.direction` — `"long"` or `"short"`
+  - `row.targets` — `number[]` of take-profit levels
+  - `row.stoploss` — stop-loss price as `number`
+</ParamField>
+
+<ResponseField name="data" type="RiskOutlineContract | null">
+  The structured LLM response when `isValid` is `true`. Shape is validated
+  against the `RiskOutlineFormat` Zod schema (see below).
+</ResponseField>
+
+<ResponseField name="error" type="string | null">
+  An error message string when `isValid` is `false`, otherwise `null`.
+</ResponseField>
+
+<ResponseField name="isValid" type="boolean">
+  `true` when the LLM produced a valid, schema-conformant response.
+  `SignalLogicService` throws on `false`.
+</ResponseField>
+
+---
+
+## `RiskOutlineContract` Schema
+
+Defined in `contract/RiskOutline.ts` using Zod. This is the exact shape of `outline` after `RUN_OUTLINE_FN` returns.
+
+<Expandable title="Full RiskOutlineFormat Zod schema">
+
+```typescript
+import { z } from "zod";
+
+export const RiskOutlineFormat = z.object({
+  action: z.enum(["skip", "follow"]),
+  // "follow" → open position in the signal's direction
+  // "skip"   → pass on the signal
+
+  sure_level: z.enum(["low", "low_medium", "medium", "medium_high", "high"]),
+  // Confidence that price-manipulation candle patterns are present
+
+  confidence: z.enum(["reliable", "not_reliable"]),
+  // Data quality indicator for the overall assessment
+
+  description: z.string(),
+  // 2-3 sentence trader-facing summary naming the rule and key numbers
+
+  reasoning: z.string(),
+  // Newline-separated step-by-step trace:
+  //   Step 1: metric values used
+  //   Step 2: applied rule → action
+  //   Step 3: sure_level and confidence
+});
+
+export type RiskOutlineContract = z.infer<typeof RiskOutlineFormat>;
+```
+
+</Expandable>
+
+---
+
+## DTO Field Mapping Cheatsheet
+
+The table below shows the complete mapping from `IParserRow` and `RiskOutlineContract` fields to `IScreenDto` fields.
+
+| `IScreenDto` field | Source | Origin field |
+|---|---|---|
+| `parserItemId` | `IParserRow` | `row.id` |
+| `channel` | `IParserRow` | `row.channel` |
+| `source` | `IParserRow` | `row.source` |
+| `publishedAt` | `IParserRow` | `row.publishedAt` |
+| `symbol` | `IParserRow` | `row.symbol` |
+| `direction` | `IParserRow` | `row.direction` |
+| `entryFrom` | `IParserRow` | `row.entry.from` *(flattened)* |
+| `entryTo` | `IParserRow` | `row.entry.to` *(flattened)* |
+| `targets` | `IParserRow` | `row.targets` |
+| `stoploss` | `IParserRow` | `row.stoploss` |
+| `note` | `IParserRow` | `row.note` |
+| `content` | `IParserRow` | `row.content` |
+| `riskSureLevel` | `RiskOutlineContract` | `outline.sure_level` |
+| `riskConfidence` | `RiskOutlineContract` | `outline.confidence` |
+| `riskAction` | `RiskOutlineContract` | `outline.action` |
+| `riskDescription` | `RiskOutlineContract` | `outline.description` |
+| `riskReasoning` | `RiskOutlineContract` | `outline.reasoning` |
+
+<Note>
+  The `entry` object from `IParserRow` (`{ from, to }`) is **flattened** into
+  two top-level fields (`entryFrom`, `entryTo`) in `IScreenDto`. The nested
+  object is not stored in `screen-items`.
+</Note>
+
+---
+
+## Error Handling
+
+`SignalLogicService.execute` propagates errors in two scenarios:
+
+1. **`isValid: false`** — The LLM outline returned an invalid or unparseable response. `RUN_OUTLINE_FN` throws `new Error(error)`. The caller (`SignalJobService.RUN_IN_CONTEXT_FN`) receives the exception.
+
+2. **Network / timeout errors** — Any exception thrown by `json()` itself (e.g. the Ollama instance is unreachable) propagates unmodified.
+
+```typescript
+try {
+  const dto = await signalLogicService.execute(row);
+  await screenDbService.create(dto);
+} catch (err) {
+  // Log and skip — the parser-items row remains unvisited
+  // and will be retried on the next signalJobSubject.next() tick
+  logger.error("signalLogicService execute failed", { rowId: row.id, err });
+}
+```
+
+<Warning>
+  If `execute` throws, `SignalJobService` does not catch the error internally —
+  it will propagate out of the `queued` runner. Wrap the call site if you need
+  per-row fault tolerance.
+</Warning>
+
+<CardGroup cols={2}>
+  <Card title="SignalJobService" icon="bolt" href="/reference/signal-job-service">
+    Calls `execute()` inside `RUN_IN_CONTEXT_FN` for every unvisited
+    `parser-items` row.
+  </Card>
+  <Card title="CrawlerService" icon="spider" href="/reference/crawler-service">
+    Produces the `IParserRow` documents that `execute()` consumes.
+  </Card>
+</CardGroup>

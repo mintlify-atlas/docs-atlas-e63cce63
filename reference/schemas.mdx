@@ -1,0 +1,489 @@
+---
+title: "MongoDB Schemas: parser-items and screen-items Collections"
+sidebarTitle: "Schemas"
+description: "Mongoose schema definitions, TypeScript interfaces, and MongoDB indexes for the parser-items and screen-items collections used by backtest-ollama-crontab."
+---
+
+The `packages/core` package defines two Mongoose-backed MongoDB collections that form the persistence backbone of the pipeline. Raw Telegram signals land in **parser-items** after being scraped and parsed; once the local Ollama LLM has evaluated each row, the risk verdict is written to **screen-items**. A shared `BaseCRUD` factory provides all standard read/write operations for both collections without duplication.
+
+---
+
+## `parser-items` Collection
+
+The `parser-items` collection stores every trading signal extracted from Telegram. Each document maps one-to-one with a single Telegram message from a monitored channel. The `visited` flag starts as `false` and is flipped to `true` only after the LLM screening job has processed the row, making it the primary cursor for the 15-minute crontab.
+
+### TypeScript Interfaces
+
+```typescript
+/** Input shape — used when creating a new parser document */
+interface IParserDto {
+  channel: string;
+  source: string;
+  messageId: number;
+  publishedAt: Date;
+  note: string;
+
+  symbol: string;
+  direction: "long" | "short";
+  entry: { from: number; to: number };
+  targets: number[];
+  stoploss: number;
+
+  content: unknown;
+}
+
+/** Output shape — returned by BaseCRUD methods after readTransform */
+interface IParserRow extends IParserDto {
+  id: string;
+  visited: boolean;
+  createDate: Date;
+  updatedDate: Date;
+}
+```
+
+### Field Reference
+
+<ResponseField name="channel" type="string" required>
+  Telegram channel name that published the signal. Carries a single-field ascending index (`channel: 1`) and participates in the unique compound index `{ channel: 1, messageId: 1 }`.
+</ResponseField>
+
+<ResponseField name="source" type="string" required>
+  Source identifier string for the originating feed or bot account. Indexed (`source: 1`).
+</ResponseField>
+
+<ResponseField name="messageId" type="number" required>
+  Telegram-assigned numeric message ID within the channel. Indexed (`messageId: 1`). Together with `channel` it forms the unique compound index that prevents duplicate ingestion.
+</ResponseField>
+
+<ResponseField name="publishedAt" type="Date" required>
+  UTC timestamp at which the message was published in the Telegram channel. Indexed (`publishedAt: 1`) and used as the descending sort key in the composite index `{ symbol: 1, publishedAt: -1 }`.
+</ResponseField>
+
+<ResponseField name="note" type="string" required>
+  Raw, unprocessed message text as received from Telegram — the full original string before field extraction.
+</ResponseField>
+
+<ResponseField name="symbol" type="string" required>
+  Normalised trading pair, e.g. `"SOLUSDT"`. Indexed (`symbol: 1`) and the leading key of the composite index `{ symbol: 1, publishedAt: -1 }`.
+</ResponseField>
+
+<ResponseField name="direction" type='"long" | "short"' required>
+  Trade direction extracted from the signal. Validated against the enum `["long", "short"]`.
+</ResponseField>
+
+<ResponseField name="entry" type="object" required>
+  Entry price zone as a nested sub-document.
+
+  <Expandable title="entry fields">
+    <ResponseField name="entry.from" type="number" required>
+      Lower bound of the entry zone.
+    </ResponseField>
+    <ResponseField name="entry.to" type="number" required>
+      Upper bound of the entry zone.
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+
+<ResponseField name="targets" type="number[]" required>
+  Ordered array of take-profit price levels as published in the signal.
+</ResponseField>
+
+<ResponseField name="stoploss" type="number" required>
+  Stop-loss price level.
+</ResponseField>
+
+<ResponseField name="content" type="unknown" required>
+  Full parsed signal object stored as `Schema.Types.Mixed`. Preserves the complete structured output of the parser for debugging and audit purposes.
+</ResponseField>
+
+<ResponseField name="visited" type="boolean" required>
+  Set to `false` on document creation (Mongoose `default: false`). The 15-minute crontab queries `{ visited: false }` to find unprocessed rows; `ParserDbService.markVisited()` flips this to `true` once the LLM job completes. Indexed (`visited: 1`).
+</ResponseField>
+
+<ResponseField name="id" type="string">
+  MongoDB `ObjectId` serialised as a hex string. Added by `readTransform` on `IParserRow`; not present on `IParserDto`.
+</ResponseField>
+
+<ResponseField name="createDate" type="Date">
+  Auto-set by Mongoose timestamps (`createdAt` alias). Present on `IParserRow` only.
+</ResponseField>
+
+<ResponseField name="updatedDate" type="Date">
+  Auto-set by Mongoose timestamps (`updatedAt` alias). Present on `IParserRow` only.
+</ResponseField>
+
+### MongoDB Indexes
+
+| Index definition | Options | Purpose |
+|---|---|---|
+| `{ channel: 1, messageId: 1 }` | `unique: true` | Idempotent upsert — prevents duplicate messages |
+| `{ symbol: 1, publishedAt: -1 }` | — | Fast lookups of recent signals by symbol |
+| `{ channel: 1 }` | — | Filter by channel |
+| `{ source: 1 }` | — | Filter by source |
+| `{ messageId: 1 }` | — | Direct message lookup |
+| `{ publishedAt: 1 }` | — | Date-range queries |
+| `{ symbol: 1 }` | — | Symbol filter |
+| `{ visited: 1 }` | — | Crontab queue scan |
+
+---
+
+## `screen-items` Collection
+
+The `screen-items` collection holds the LLM risk-assessment verdict for each parser row. A screen document is created exactly once per parser row (enforced by the unique index on `parserItemId`). The entry zone is **flattened** from the nested `entry.{ from, to }` shape of `parser-items` into top-level `entryFrom`/`entryTo` fields for easier query expressions.
+
+### TypeScript Interfaces
+
+```typescript
+/** Input shape — used when creating a new screen document */
+interface IScreenDto {
+  parserItemId: string;
+  channel: string;
+  source: string;
+  publishedAt: Date;
+  symbol: string;
+
+  direction: "long" | "short";
+  entryFrom: number;
+  entryTo: number;
+  targets: number[];
+  stoploss: number;
+
+  riskSureLevel: "low" | "low_medium" | "medium" | "medium_high" | "high";
+  riskConfidence: "reliable" | "not_reliable";
+  riskAction: "skip" | "follow";
+  riskDescription: string;
+  riskReasoning: string;
+
+  note: string;
+  content: unknown;
+}
+
+/** Output shape — returned by BaseCRUD methods after readTransform */
+interface IScreenRow extends IScreenDto {
+  id: string;
+  createDate: Date;
+  updatedDate: Date;
+}
+```
+
+### Field Reference
+
+<ResponseField name="parserItemId" type="string" required>
+  Foreign key referencing the parent `parser-items` document by its `id` string. Enforced as unique by the index `{ parserItemId: 1 }` — one screen result per parser row.
+</ResponseField>
+
+<ResponseField name="channel" type="string" required>
+  Copied from the parent parser row. Indexed.
+</ResponseField>
+
+<ResponseField name="source" type="string" required>
+  Copied from the parent parser row. Indexed.
+</ResponseField>
+
+<ResponseField name="publishedAt" type="Date" required>
+  Copied from the parent parser row. Indexed and used in the composite `{ symbol: 1, publishedAt: -1 }` index.
+</ResponseField>
+
+<ResponseField name="symbol" type="string" required>
+  Copied from the parent parser row. Indexed and the leading key of the composite `{ symbol: 1, publishedAt: -1 }` index.
+</ResponseField>
+
+<ResponseField name="direction" type='"long" | "short"' required>
+  Trade direction, copied from the parent parser row.
+</ResponseField>
+
+<ResponseField name="entryFrom" type="number" required>
+  Lower bound of the entry zone, flattened from `entry.from` on the parser row.
+</ResponseField>
+
+<ResponseField name="entryTo" type="number" required>
+  Upper bound of the entry zone, flattened from `entry.to` on the parser row.
+</ResponseField>
+
+<ResponseField name="targets" type="number[]" required>
+  Take-profit levels, copied from the parent parser row.
+</ResponseField>
+
+<ResponseField name="stoploss" type="number" required>
+  Stop-loss price, copied from the parent parser row.
+</ResponseField>
+
+<ResponseField name="riskAction" type='"skip" | "follow"' required>
+  **The primary LLM verdict.** `"follow"` means the model judges the signal safe to act on; `"skip"` means it should be ignored. Indexed (`riskAction: 1`). Strategy files read this field to gate position entry.
+</ResponseField>
+
+<ResponseField name="riskSureLevel" type='"low" | "low_medium" | "medium" | "medium_high" | "high"' required>
+  The model's self-reported confidence that candle-level manipulation was detected. Stored for audit and backtesting analysis. Indexed (`riskSureLevel: 1`).
+
+  | Value | Meaning |
+  |---|---|
+  | `low` | No manipulation traces; volume structure is organic |
+  | `low_medium` | One recent anomaly without price displacement |
+  | `medium` | One older anomaly or anomaly with price displacement |
+  | `medium_high` | Repeated accumulation pattern detected |
+  | `high` | Multiple accumulation events with clear price displacement |
+</ResponseField>
+
+<ResponseField name="riskConfidence" type='"reliable" | "not_reliable"' required>
+  The model's confidence in its own evaluation. `"reliable"` means data was unambiguous; `"not_reliable"` means data was contradictory, sparse, or absent. Stored for audit. Indexed (`riskConfidence: 1`).
+</ResponseField>
+
+<ResponseField name="riskDescription" type="string" required>
+  A 2–3 sentence human-readable summary of the verdict written by the LLM, naming the applied rule and key numeric values.
+</ResponseField>
+
+<ResponseField name="riskReasoning" type="string" required>
+  Step-by-step reasoning produced by the LLM as a single newline-separated string. Covers metrics used, the applied rule, and the derivation of `riskSureLevel`/`riskConfidence`.
+</ResponseField>
+
+<ResponseField name="note" type="string" required>
+  Raw message text, copied from the parent parser row.
+</ResponseField>
+
+<ResponseField name="content" type="unknown" required>
+  Full parsed signal object (`Schema.Types.Mixed`), copied from the parent parser row.
+</ResponseField>
+
+<ResponseField name="id" type="string">
+  MongoDB `ObjectId` as a hex string added by `readTransform`. Present on `IScreenRow` only.
+</ResponseField>
+
+<ResponseField name="createDate" type="Date">
+  Auto-set Mongoose timestamp. Present on `IScreenRow` only.
+</ResponseField>
+
+<ResponseField name="updatedDate" type="Date">
+  Auto-set Mongoose timestamp. Present on `IScreenRow` only.
+</ResponseField>
+
+### MongoDB Indexes
+
+| Index definition | Options | Purpose |
+|---|---|---|
+| `{ parserItemId: 1 }` | `unique: true` | One screen result per parser row |
+| `{ symbol: 1, publishedAt: -1 }` | — | Fast recent-signal lookups by symbol |
+| `{ channel: 1 }` | — | Filter by channel |
+| `{ source: 1 }` | — | Filter by source |
+| `{ publishedAt: 1 }` | — | Date-range queries |
+| `{ symbol: 1 }` | — | Symbol filter |
+| `{ riskAction: 1 }` | — | Quick `follow`/`skip` partition |
+| `{ riskSureLevel: 1 }` | — | Audit-log queries |
+| `{ riskConfidence: 1 }` | — | Audit-log queries |
+
+---
+
+## `RiskOutlineFormat` Zod Schema
+
+The `RiskOutlineFormat` zod schema, defined in `packages/core/src/contract/RiskOutline.ts`, describes the **exact JSON object** the Ollama LLM must return. The four fields map directly onto the corresponding `risk*` columns of `screen-items`.
+
+```typescript
+import { str } from "functools-kit";
+import { z } from "zod";
+
+export const RiskOutlineFormat = z.object({
+  action: z
+    .enum(["skip", "follow"])
+    .describe(
+      str.newline(
+        "Решение об открытии позиции:",
+        "follow — открыть позицию в направлении канала (direction из draft signal)",
+        "skip — пропустить сигнал, не открывать позицию",
+      )
+    ),
+  sure_level: z
+    .enum(["low", "low_medium", "medium", "medium_high", "high"])
+    .describe(
+      str.newline(
+        "Уровень уверенности в наличии манипуляции в свечах (для audit log):",
+        "low — следов нет, структура объёма органична",
+        "low_medium — одна свежая аномалия без смещения",
+        "medium — одна аномалия давно или со смещением цены",
+        "medium_high — повторяющееся накопление",
+        "high — множественное накопление с явным смещением цены",
+      )
+    ),
+  confidence: z
+    .enum(["reliable", "not_reliable"])
+    .describe(
+      str.newline(
+        "Уверенность в оценке (для audit log):",
+        "reliable — данные однозначны",
+        "not_reliable — данные противоречивы, слабые или отсутствуют",
+      )
+    ),
+  description: z
+    .string()
+    .describe(
+      str.newline(
+        "Краткое объяснение action для трейдера (2-3 предложения).",
+        "Назови применённое правило и числа. Пример:",
+        "'Action skip. SHORT на спящем активе (avgRangePct 0.045% < 0.07%) — stop-hunt мишень. Sure_level high, confidence reliable.'"
+      )
+    ),
+  reasoning: z
+    .string()
+    .describe(
+      str.newline(
+        "Детальное обоснование (одна строка с переводами через \\n, НЕ объект, НЕ массив):",
+        "Шаг 1: avgRangePct=X%, momentum24hPct=Y% (из метрик)",
+        "Шаг 2: применённое правило → action",
+        "Шаг 3: sure_level и confidence",
+      )
+    ),
+});
+
+export type RiskOutlineContract = z.infer<typeof RiskOutlineFormat>;
+```
+
+<Note>
+  The LLM is instructed to produce `reasoning` as a **single newline-separated string**, not a JSON object or array. The zod schema enforces `z.string()` to catch malformed responses before they reach the database write path.
+</Note>
+
+The inferred TypeScript type `RiskOutlineContract` is:
+
+```typescript
+type RiskOutlineContract = {
+  action: "skip" | "follow";
+  sure_level: "low" | "low_medium" | "medium" | "medium_high" | "high";
+  confidence: "reliable" | "not_reliable";
+  description: string;
+  reasoning: string;
+};
+```
+
+The `SignalLogicService` maps these fields onto `IScreenDto` as follows:
+
+| `RiskOutlineContract` field | `IScreenDto` / `IScreenRow` field |
+|---|---|
+| `action` | `riskAction` |
+| `sure_level` | `riskSureLevel` |
+| `confidence` | `riskConfidence` |
+| `description` | `riskDescription` |
+| `reasoning` | `riskReasoning` |
+
+---
+
+## `BaseCRUD` — Shared Database Base Class
+
+`BaseCRUD` is a `di-factory` factory function located at `packages/core/src/lib/common/BaseCRUD.ts`. Both `ParserDbService` and `ScreenDbService` extend it by passing their respective Mongoose model. Every method runs `readTransform` on the raw `toJSON()` output to normalise the `_id → id` renaming and strip internal Mongoose fields.
+
+<Note>
+  `BaseCRUD` is created with `factory()` from `di-factory`, so it is a **mixin constructor** — subclasses call `BaseCRUD(Model)` to get a class they can extend, not a singleton.
+</Note>
+
+### Methods
+
+<ResponseField name="create(dto)" type="Promise<object>">
+  Inserts a new document using `Model.create(dto)` and returns the transformed row.
+
+  ```typescript
+  async create(dto: object): Promise<object>
+  ```
+</ResponseField>
+
+<ResponseField name="update(id, dto)" type="Promise<object>">
+  Calls `Model.findByIdAndUpdate` with `{ new: true, runValidators: true }`. Strips the `id` key from `dto` before updating to prevent ObjectId conflicts. Throws `Error("<ModelName> not found")` if no document matches.
+
+  ```typescript
+  async update(id: string, dto: object): Promise<object>
+  ```
+</ResponseField>
+
+<ResponseField name="findById(id)" type="Promise<object>">
+  Finds a document by its MongoDB `_id`. Throws `Error("<ModelName> not found")` if the document does not exist.
+
+  ```typescript
+  async findById(id: string): Promise<object>
+  ```
+</ResponseField>
+
+<ResponseField name="findByFilter(filterData, sort?)" type="Promise<object | null>">
+  Calls `Model.findOne(filterData, null, { sort })`. Returns the transformed document or `null` if no match exists.
+
+  ```typescript
+  async findByFilter(filterData: object, sort?: object): Promise<object | null>
+  ```
+</ResponseField>
+
+<ResponseField name="findAll(filterData?, limit?)" type="Promise<object[]>">
+  Calls `Model.find(filterData).sort({ date: -1 }).limit(limit)`. Default `filterData` is `{}` and default `limit` is `1000`.
+
+  ```typescript
+  async findAll(filterData?: object, limit?: number): Promise<object[]>
+  ```
+</ResponseField>
+
+<ResponseField name="iterate(filterData?, sort?)" type="AsyncGenerator<object>">
+  An async generator that streams documents from MongoDB one at a time. Suitable for large result sets where loading everything into memory is undesirable.
+
+  ```typescript
+  async *iterate(filterData?: object, sort?: object): AsyncGenerator<object>
+  ```
+
+  ```typescript
+  for await (const row of core.parserDbService.iterate({ visited: false })) {
+    // process one row at a time — no 1 000-row cap
+  }
+  ```
+</ResponseField>
+
+<ResponseField name="paginate(filterData, pagination, sort?)" type="Promise<{ rows: object[]; total: number }>">
+  Returns a page of results plus the full collection count for the given filter. Uses `.skip(offset).limit(limit)` internally.
+
+  ```typescript
+  async paginate(
+    filterData: object,
+    pagination: { limit: number; offset: number },
+    sort?: object
+  ): Promise<{ rows: object[]; total: number }>
+  ```
+
+  ```typescript
+  const page = await core.screenDbService.paginate(
+    { riskAction: "follow" },
+    { limit: 50, offset: 0 },
+    { publishedAt: -1 }
+  );
+  console.log(page.total, page.rows.length);
+  ```
+</ResponseField>
+
+### `ParserDbService` — Extended Methods
+
+`ParserDbService` (at `packages/core/src/lib/services/db/ParserDbService.ts`) extends `BaseCRUD` with upsert semantics and several typed query helpers.
+
+<ResponseField name="create(dto: IParserDto)" type="Promise<IParserRow>">
+  Uses `$setOnInsert` with an upsert on `{ channel, messageId }`. If a document already exists for that pair it is returned unchanged — preventing duplicate ingestion.
+</ResponseField>
+
+<ResponseField name="findAllByVisited(visited: boolean)" type="Promise<IParserRow[]>">
+  Shorthand for `findAll({ visited })`. Used by the crontab to fetch the unprocessed queue.
+</ResponseField>
+
+<ResponseField name="findAllByPublishedAt(from: Date, to: Date)" type="Promise<IParserRow[]>">
+  Returns all rows whose `publishedAt` falls within the closed `[from, to]` range.
+</ResponseField>
+
+<ResponseField name="findLast4HourRow(symbol: string, when: Date)" type="Promise<IParserRow | null>">
+  Returns the most recent parser row for `symbol` within the 4-hour window ending at `when`, sorted by `publishedAt` descending.
+</ResponseField>
+
+<ResponseField name="markVisited(rowId: string)" type="Promise<boolean>">
+  Sets `visited: true` on a single document via `$set`. Returns `true` if a document was updated, `false` otherwise.
+</ResponseField>
+
+### `ScreenDbService` — Extended Methods
+
+`ScreenDbService` (at `packages/core/src/lib/services/db/ScreenDbService.ts`) uses the same upsert pattern keyed on `parserItemId`.
+
+<ResponseField name="create(dto: IScreenDto)" type="Promise<IScreenRow>">
+  Uses `$setOnInsert` with an upsert on `{ parserItemId }`. Idempotent — calling it twice for the same parser row is safe.
+</ResponseField>
+
+<ResponseField name="findByParserItem(parserItemId: string)" type="Promise<IScreenRow | null>">
+  Returns the screen row associated with the given parser row ID, or `null` if screening has not yet run.
+</ResponseField>
+
+<ResponseField name="findLast4HourRow(symbol: string, when: Date)" type="Promise<IScreenRow | null>">
+  Returns the most recent screen row for `symbol` within the 4-hour window ending at `when`, sorted by `publishedAt` descending. Called by `SignalMainService.getLast4HourSignal`.
+</ResponseField>

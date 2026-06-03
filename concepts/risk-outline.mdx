@@ -1,0 +1,351 @@
+---
+title: "Ollama Risk Outline: Two-Rule LLM Signal Filter"
+sidebarTitle: "Risk Outline"
+description: "How the RiskOutline prompt encodes two empirical trading rules, feeds candle data to a local gpt-oss model, and produces a zod-validated verdict."
+---
+
+The most critical component in `backtest-ollama-crontab` is the risk outline defined in `packages/core/src/logic/outline/risk.outline.ts`. It transforms every parsed Telegram signal into a structured verdict by feeding live candle data plus pre-computed market metrics to a local Ollama model (`gpt-oss` quantized). The output is a zod-validated JSON object that either passes the signal through (`"follow"`) or kills it before it ever reaches the strategy (`"skip"`). The two rules embedded in the system prompt were derived empirically from backtesting and are intentionally narrow — the LLM is not asked to exercise judgment; it is asked to apply literal threshold checks.
+
+## The two veto rules
+
+The `RISK_PROMPT` constant (translated from Russian) encodes exactly three decision branches. Branches 1 and 2 are the veto conditions; branch 3 is the default pass-through.
+
+<CardGroup cols={3}>
+  <Card title="Rule 1 — Sleeping Coin SHORT" icon="moon">
+    **Condition:** `direction = SHORT` **AND** `avgRangePct < 0.07%`
+
+    **Action:** `"skip"`
+
+    A coin whose 1-minute candles have an average high-low range of less than 0.07% of close price has thin liquidity. Shorting into this state invites a stop-hunt: a single large buy order will sweep stops above the entry zone before the price resumes its direction. The prompt calls this a *"stop-hunt target"*.
+  </Card>
+  <Card title="Rule 2 — Knife-Catching LONG" icon="knife">
+    **Condition:** `direction = LONG` **AND** `momentum24hPct < -1%`
+
+    **Action:** `"skip"`
+
+    A coin that has fallen more than 1% over the past 24 hours is in active downward momentum. Buying a LONG signal into this move means subscribers enter on the way down; the stop-loss triggers as price continues falling. The prompt calls this *"buying into a falling market"*.
+  </Card>
+  <Card title="Rule 3 — Default" icon="circle-check">
+    **Condition:** Neither Rule 1 nor Rule 2 triggered
+
+    **Action:** `"follow"`
+
+    If neither skip condition is met the signal is passed through as-is. The LLM applies no further judgment — no trend analysis, no news, no momentum on shorter intervals. The rules are applied literally.
+  </Card>
+</CardGroup>
+
+<Warning>
+  `action` is determined **only** by `avgRangePct` / `momentum24hPct` thresholds against `direction`. `sure_level` and `confidence` are audit-log fields filled independently and do **not** influence `action`. A signal can be `action: "skip"` with `confidence: "not_reliable"` — those two dimensions are orthogonal.
+</Warning>
+
+## The RISK_PROMPT constant
+
+The following is the full English translation of the `RISK_PROMPT` constant from `risk.outline.ts`:
+
+```text
+You are a Telegram channel scam-signal detector. Your only task is to answer whether
+the proposed channel signal can be traded. Answer with action: "follow" (open a
+position in the channel's direction) or "skip" (pass on the signal).
+
+Make your decision ONLY based on two empirically derived rules. No other
+considerations (trend, news, short-interval momentum) are relevant. Apply the rules
+literally.
+
+Available data:
+ - Pre-computed metrics (sent as a separate user message): avgRangePct and
+   momentum24hPct for the 24 hours before publication.
+ - 1m candles for the last 4 hours and 15m candles for the last 8 hours — for
+   evaluating sure_level and confidence (audit log).
+ - Draft channel signal: symbol, direction (LONG or SHORT), targets, stoploss.
+
+Decision rules for action:
+
+RULE 1 (sleeping coin SHORT):
+  If direction = SHORT AND avgRangePct < 0.07% → action = "skip".
+  Explanation: a "sleeping" asset with thin liquidity (narrow 1m candle range) is a
+  perfect stop-hunt target. The channel calls SHORT; a market-maker will sweep stops
+  upward with a single large candle.
+
+RULE 2 (knife-catching LONG):
+  If direction = LONG AND momentum24hPct < -1% → action = "skip".
+  Explanation: the channel calls LONG in a falling market. Subscribers buy on the way
+  down, the market continues falling, the stop-loss triggers.
+
+RULE 3 (default):
+  If no skip rule triggered → action = "follow".
+
+IMPORTANT: action does NOT depend on sure_level and confidence. Rules are applied
+strictly from avgRangePct/momentum24hPct and direction. sure_level and confidence go
+into the audit log for post-analysis.
+
+Steps for action:
+  Step 1. Read avgRangePct and momentum24hPct from the metrics message (already
+          pre-computed and provided).
+  Step 2. Check RULE 1 (SHORT + low volatility).
+  Step 3. Check RULE 2 (LONG + falling market).
+  Step 4. If no rule triggered → action = "follow".
+
+Audit fields (fill honestly; they do NOT affect action):
+
+  sure_level — confidence that candles contain accumulation traces:
+  - low: volume structure is organic
+  - low_medium: one fresh anomaly without price displacement
+  - medium: one old anomaly or one with price displacement
+  - medium_high: repeated accumulation
+  - high: multiple accumulations with clear price displacement
+
+  confidence — data reliability:
+  - reliable: >= 60 1m candles available, metrics are unambiguous
+  - not_reliable: data is sparse, contradictory, or missing
+
+Required output:
+1. action: "skip" or "follow".
+2. sure_level: one of five levels.
+3. confidence: reliable or not_reliable.
+4. description: 2-3 sentences naming the applied rule with specific numbers.
+5. reasoning: ONE STRING (type string, NOT object/dict/array). Steps separated by \n.
+```
+
+## Pre-computed metrics
+
+Before the LLM is invoked, `commitMetricsHistory` fetches exactly **1440 one-minute candles** (24 hours) via `getCandles(symbol, "1m", 1440)` from `backtest-kit` and computes two scalar metrics:
+
+```typescript
+// packages/core/src/logic/outline/risk.outline.ts
+const PRE_CANDLES_LIMIT = 1440; // 24 h of 1m candles
+
+const commitMetricsHistory = async (symbol: string, history: IOutlineHistory) => {
+  const candles = await getCandles(symbol, "1m", PRE_CANDLES_LIMIT);
+  if (candles.length === 0) {
+    throw new Error("commitMetricsHistory: no candles returned");
+  }
+
+  // Average candle range as % of close price — measures liquidity depth
+  const avgRangePct =
+    candles.reduce((acc, c) => acc + ((c.high - c.low) / c.close) * 100, 0) /
+    candles.length;
+
+  // 24-hour momentum: (lastClose - firstOpen) / firstOpen * 100
+  const momentum24hPct =
+    ((candles[candles.length - 1].close - candles[0].open) / candles[0].open) * 100;
+
+  await history.push(
+    {
+      role: "user",
+      content: [
+        "Read pre-computed metrics for 24 hours before signal publication and say OK",
+        "",
+        `avgRangePct: ${avgRangePct.toFixed(4)}%`,
+        `momentum24hPct: ${momentum24hPct.toFixed(2)}%`,
+        `candlesCount: ${candles.length}`,
+      ].join("\n"),
+    },
+    { role: "assistant", content: "OK" },
+  );
+};
+```
+
+| Metric | Formula | Threshold used |
+|---|---|---|
+| `avgRangePct` | `mean((high − low) / close × 100)` over 1440 candles | `< 0.07%` triggers Rule 1 for SHORT |
+| `momentum24hPct` | `(lastClose − firstOpen) / firstOpen × 100` | `< −1%` triggers Rule 2 for LONG |
+
+## Outline history construction
+
+The `getOutlineHistory` function builds a multi-turn conversation in four sequential commits before the final instruction message. Each commit function pushes a `user`/`assistant` pair into the `IOutlineHistory` object, so the model receives all context in a single structured conversation.
+
+<Steps>
+
+  <Step title="commitOneMinuteHistory — last 4 hours of 1m candles">
+    Calls `ask(symbol, AdvisorName.StockData1mAdvisor)` from `agent-swarm-kit`. `StockData1mAdvisor` retrieves a formatted candle report for the last 4 hours at 1-minute resolution. This data is used by the model to assess `sure_level` and `confidence` (audit fields only — it does not affect `action`).
+
+    ```typescript
+    const report = await ask(symbol, AdvisorName.StockData1mAdvisor);
+    await history.push(
+      { role: "user",      content: "Read the latest 1m candles and say OK\n\n" + report },
+      { role: "assistant", content: "OK" },
+    );
+    ```
+  </Step>
+
+  <Step title="commitFifteenMinuteHistory — last 8 hours of 15m candles">
+    Calls `ask(symbol, AdvisorName.StockData15mAdvisor)`. Provides a broader 8-hour view at 15-minute resolution, also used for the audit-log fields `sure_level` and `confidence`.
+
+    ```typescript
+    const report = await ask(symbol, AdvisorName.StockData15mAdvisor);
+    await history.push(
+      { role: "user",      content: "Read the latest 15m candles and say OK\n\n" + report },
+      { role: "assistant", content: "OK" },
+    );
+    ```
+  </Step>
+
+  <Step title="commitMetricsHistory — avgRangePct and momentum24hPct">
+    Fetches 1440 × 1m candles via `getCandles`, computes both scalars inline, and pushes them as a pre-formatted metrics block. These are the **only** numbers the model reads when deciding `action`.
+  </Step>
+
+  <Step title="commitDraftSignal — symbol, direction, targets, stoploss">
+    Pushes the raw signal details from `IParserRow` so the model can reference the direction when applying Rules 1 and 2.
+
+    ```typescript
+    await history.push([
+      {
+        role: "user",
+        content: [
+          "READ DRAFT SIGNAL FOR REVIEW",
+          "",
+          `Symbol: ${draftSignal.symbol}`,
+          `Position: ${draftSignal.direction.toUpperCase()}`,
+          `Targets: ${draftSignal.targets.map(v => `${v.toFixed(6)} USD`).join(", ")}`,
+          `Hard Stop: ${draftSignal.stoploss.toFixed(6)} USD`,
+        ].join("\n"),
+      },
+      { role: "assistant", content: "Draft signal received." },
+    ]);
+    ```
+  </Step>
+
+</Steps>
+
+After all four commits, the final `user` message instructs the model to apply the rules literally from the pre-computed metrics and return all five output fields.
+
+## Zod output schema
+
+The `RiskOutlineFormat` zod schema (from `packages/core/src/contract/RiskOutline.ts`) is passed to `zodResponseFormat()` from `openai/helpers/zod`, which constrains the model's output to valid JSON matching the schema:
+
+```typescript
+// packages/core/src/contract/RiskOutline.ts
+import { z } from "zod";
+
+export const RiskOutlineFormat = z.object({
+  action: z
+    .enum(["skip", "follow"])
+    .describe(
+      "follow — open a position in the channel's direction\n" +
+      "skip — pass on the signal, do not open a position"
+    ),
+  sure_level: z
+    .enum(["low", "low_medium", "medium", "medium_high", "high"])
+    .describe(
+      "Confidence that candles contain manipulation traces (audit log):\n" +
+      "low — no traces, organic volume structure\n" +
+      "low_medium — one fresh anomaly without displacement\n" +
+      "medium — one old anomaly or with price displacement\n" +
+      "medium_high — repeated accumulation\n" +
+      "high — multiple accumulations with clear price displacement"
+    ),
+  confidence: z
+    .enum(["reliable", "not_reliable"])
+    .describe(
+      "Data reliability (audit log):\n" +
+      "reliable — data is unambiguous\n" +
+      "not_reliable — data is contradictory, sparse, or missing"
+    ),
+  description: z
+    .string()
+    .describe(
+      "Brief explanation of action for the trader (2-3 sentences). " +
+      "Name the applied rule and specific numbers."
+    ),
+  reasoning: z
+    .string()
+    .describe(
+      "Detailed justification (one string with \\n separators, NOT an object or array):\n" +
+      "Step 1: avgRangePct=X%, momentum24hPct=Y% (from metrics)\n" +
+      "Step 2: applied rule → action\n" +
+      "Step 3: sure_level and confidence"
+    ),
+});
+
+export type RiskOutlineContract = z.infer<typeof RiskOutlineFormat>;
+```
+
+## Five validation rules
+
+After the model returns its response, `addOutline` runs five sequential validators before the result is accepted. A failed validation triggers a retry:
+
+<Steps>
+
+  <Step title="action is in allowed set">
+    ```typescript
+    validate: ({ data }) => {
+      const ACTIONS = ["skip", "follow"];
+      if (!ACTIONS.includes(data.action)) {
+        throw new Error(`action "${data.action}" outside allowed set ${ACTIONS.join(", ")}`);
+      }
+    }
+    ```
+  </Step>
+
+  <Step title="sure_level is one of five values">
+    ```typescript
+    validate: ({ data }) => {
+      const SURE_LEVELS = ["low", "low_medium", "medium", "medium_high", "high"];
+      if (!SURE_LEVELS.includes(data.sure_level)) {
+        throw new Error(`sure_level "${data.sure_level}" outside allowed set`);
+      }
+    }
+    ```
+  </Step>
+
+  <Step title="confidence is reliable or not_reliable">
+    ```typescript
+    validate: ({ data }) => {
+      if (data.confidence !== "reliable" && data.confidence !== "not_reliable") {
+        throw new Error(`confidence must be "reliable" or "not_reliable"`);
+      }
+    }
+    ```
+  </Step>
+
+  <Step title="description is at least 30 characters">
+    ```typescript
+    validate: ({ data }) => {
+      if (typeof data.description !== "string" || data.description.trim().length < 30) {
+        throw new Error(`description too short (${data.description?.length ?? 0} chars)`);
+      }
+    }
+    ```
+  </Step>
+
+  <Step title="reasoning is at least 80 characters">
+    ```typescript
+    validate: ({ data }) => {
+      if (typeof data.reasoning !== "string" || data.reasoning.trim().length < 80) {
+        throw new Error(`reasoning too short (${data.reasoning?.length ?? 0} chars)`);
+      }
+    }
+    ```
+  </Step>
+
+</Steps>
+
+<Tip>
+  Valid documents are automatically dumped to `./dump/outline/risk` via the `onValidDocument` callback, giving you a local audit trail of every LLM decision without any additional tooling.
+</Tip>
+
+## Example output
+
+A well-formed `RiskOutlineContract` for a SHORT signal on a thinly traded coin looks like:
+
+```json
+{
+  "action": "skip",
+  "sure_level": "high",
+  "confidence": "reliable",
+  "description": "Action skip. SHORT on a sleeping asset (avgRangePct 0.045% < 0.07%) — stop-hunt target. Sure_level high, confidence reliable.",
+  "reasoning": "Step 1: avgRangePct=0.0450%, momentum24hPct=1.18%\nStep 2: direction=SHORT AND avgRangePct < 0.07% → Rule 1 triggered → action=skip\nStep 3: sure_level=high (multiple accumulations with price displacement), confidence=reliable (1440 candles available)"
+}
+```
+
+And a passing LONG signal on a coin with positive momentum:
+
+```json
+{
+  "action": "follow",
+  "sure_level": "low",
+  "confidence": "reliable",
+  "description": "Action follow. No skip rule triggered: direction=LONG and momentum24hPct=+2.34% is above -1% threshold. Volume structure appears organic.",
+  "reasoning": "Step 1: avgRangePct=0.1230%, momentum24hPct=2.34%\nStep 2: direction=LONG — check Rule 2: momentum24hPct=2.34% >= -1% → Rule 2 does not trigger\nStep 3: sure_level=low (organic volume, no anomalies detected), confidence=reliable (1440 candles available)"
+}
+```

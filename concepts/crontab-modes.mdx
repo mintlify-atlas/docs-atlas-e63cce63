@@ -1,0 +1,132 @@
+---
+title: "Live and Backtest Modes via Cron.register"
+sidebarTitle: "Cron Modes"
+description: "How backtest-ollama-crontab uses Cron.register from backtest-kit to schedule 15-minute live polling and one-shot backtest data fetches."
+---
+
+`backtest-ollama-crontab` uses the `Cron.register` API from `backtest-kit` to drive data ingestion in two distinct modes without duplicating logic. The same strategy file, `jan_2026.strategy.ts`, registers two cron handlers: one that fires once at startup for backtest data preparation, and one that polls every 15 minutes when running live. The `backtest` boolean parameter passed to each handler is the gating mechanism — each handler checks it and returns early if the mode is wrong. This keeps live and backtest code paths in the same file while guaranteeing they never execute simultaneously.
+
+## The Cron.register API
+
+`Cron.register` accepts a single options object with three properties:
+
+| Property | Type | Required | Effect |
+|---|---|---|---|
+| `name` | `string` | Yes | Unique identifier for this cron registration |
+| `handler` | `async (symbol, when, backtest) => void` | Yes | Async callback invoked on each trigger |
+| `interval` | `string` (e.g. `"15m"`) | No | If provided, the handler runs on this schedule in live mode; if omitted, the handler runs once at startup |
+
+When `interval` is omitted, `backtest-kit` treats the registration as a **one-shot prepare handler** that fires once when the backtest or live session initialises. This is the mechanism used to pre-fetch historical data before the strategy's `getSignal` callback begins receiving ticks.
+
+## Two registrations in jan_2026.strategy.ts
+
+```typescript
+// content/jan_2026.strategy/jan_2026.strategy.ts
+
+// Backtest prepare — one-shot, fires at session startup
+Cron.register({
+  name: "backtest-prepare-data",
+  handler: async (symbol, when, backtest) => {
+    if (!backtest) {
+      return;
+    }
+    console.log(`Fetching backtest data symbol=${symbol} when=${when}`);
+    await core.crawlerMainService.crawlBacktestFrame(when);
+  },
+});
+
+// Live poll — fires every 15 minutes in live mode
+Cron.register({
+  name: "live-fetch-data",
+  handler: async (symbol, when, backtest) => {
+    if (backtest) {
+      return;
+    }
+    console.log(`Fetching live data symbol=${symbol} when=${when}`);
+    await core.crawlerMainService.crawlLiveFrame(when);
+  },
+  interval: "15m",
+});
+```
+
+<Note>
+  In backtest mode, the `"live-fetch-data"` handler registered with `interval: "15m"` **never runs**. The `if (backtest) return` guard at the top of its handler exits immediately on every invocation. All data fetching in backtest mode is done exclusively by the one-shot `"backtest-prepare-data"` handler.
+</Note>
+
+## crawlLiveFrame — 15-minute live polling
+
+`CrawlerMainService.crawlLiveFrame(when)` is called on every 15-minute tick in live mode. It converts the `when: Date` parameter to a day stamp using `getMomentStamp(when)`, crawls only that single day via `CrawlerService.crawlDay(stamp)`, then fires `signalJobSubject.next()` to trigger the LLM processing queue.
+
+```typescript
+// packages/core/src/lib/services/main/CrawlerMainService.ts
+public crawlLiveFrame = async (when: Date) => {
+  const mode = await getMode();
+  if (mode === "backtest") {
+    return;  // double guard — also exits if mode check fails
+  }
+  const stamp = getMomentStamp(when);
+  await this.crawlerService.crawlDay(stamp);
+  await signalJobSubject.next();
+};
+```
+
+Because `CrawlerService.crawlDay` calls `ParserDbService.create()` with a `(channel, messageId)` unique index, re-crawling the same day on the next 15-minute tick is idempotent — duplicate messages are silently ignored and only new messages produce new `parser-items` records.
+
+## crawlBacktestFrame — one-shot full-range fetch
+
+`CrawlerMainService.crawlBacktestFrame(when)` is the backtest counterpart. It reads the active frame's `startDate` and `endDate` from `listFrameSchema()`, converts both to stamps, and calls `CrawlerService.crawlRange(fromStamp, toStamp)` to fetch the entire date range in one pass.
+
+```typescript
+// packages/core/src/lib/services/main/CrawlerMainService.ts
+public crawlBacktestFrame = async (when: Date) => {
+  const { frameName } = await getContext();
+  const frameList = await listFrameSchema();
+  const { startDate, endDate } = frameList.find(
+    (frame) => frame.frameName === frameName
+  );
+  const fromStamp = getMomentStamp(startDate);
+  const toStamp   = getMomentStamp(endDate);
+  await this.crawlerService.crawlRange(fromStamp, toStamp);
+  await signalJobSubject.next();
+};
+```
+
+After `crawlRange` completes, `signalJobSubject.next()` fires and `SignalJobService` processes all newly inserted `parser-items` rows through the LLM risk gate before any strategy ticks begin.
+
+## Mode detection
+
+`getMode()` from `backtest-kit` returns `"backtest"` or `"live"` depending on how the CLI was invoked. The `--backtest` flag sets backtest mode; absence of the flag sets live mode. Both `CrawlerMainService` methods and `SignalJobService.run()` call `getMode()` internally as an additional safety check, so even if a handler guard were accidentally removed, the underlying service would still no-op in the wrong mode.
+
+<Tabs>
+  <Tab title="Live Mode Flow">
+    Every 15 minutes `backtest-kit` invokes the `"live-fetch-data"` handler:
+
+    1. `backtest === false` → handler proceeds
+    2. `crawlerMainService.crawlLiveFrame(when)` is called
+    3. `getMomentStamp(when)` converts the current date to a day stamp
+    4. `crawlerService.crawlDay(stamp)` scrapes today's messages from the Telegram channel via `CryptoYodaScreenService.screenDay(date)` → `ScraperService.scrapeDay()`
+    5. New messages are upserted into `parser-items` (duplicates ignored)
+    6. `signalJobSubject.next()` fires — `SignalJobService` processes unvisited rows through the LLM and writes results to `screen-items`
+    7. On the next price tick, `getSignal()` queries `screen-items` and opens a position if `riskAction === "follow"` and price is inside the entry zone
+
+    The `"backtest-prepare-data"` handler fires but exits immediately at `if (!backtest) return`.
+  </Tab>
+  <Tab title="Backtest Mode Flow">
+    At session startup, `backtest-kit` invokes the `"backtest-prepare-data"` one-shot handler:
+
+    1. `backtest === true` → handler proceeds
+    2. `crawlerMainService.crawlBacktestFrame(when)` is called
+    3. `getContext()` returns the active `frameName` (e.g. `"jan_2026"`)
+    4. `listFrameSchema()` resolves `startDate` and `endDate` for that frame
+    5. Both dates are converted to stamps; `crawlerService.crawlRange(fromStamp, toStamp)` fetches the entire frame in one pass
+    6. All parsed messages are inserted into `parser-items`
+    7. `signalJobSubject.next()` fires — `SignalJobService` checks `getMode() === "backtest"`, reads the frame's date range from `listFrameSchema()`, and runs each `IParserRow` through `SignalLogicService.execute()` inside a time-travel `ExecutionContextService.runInContext(...)` scope
+    8. LLM verdicts are stored in `screen-items`; strategy ticks then replay historically against the pre-populated data
+
+    The `"live-fetch-data"` handler fires on every simulated 15-minute tick but exits immediately at `if (backtest) return`.
+  </Tab>
+</Tabs>
+
+<Tip>
+  Because backtest data is fetched once and stored in MongoDB before replay begins, you can interrupt a backtest and resume it — `crawlRange` is idempotent and `SignalJobService` skips rows that already have a `screen-items` record via `screenDbService.findByParserItem(row.id)`.
+</Tip>

@@ -1,0 +1,441 @@
+---
+title: "RiskOutline: addOutline Registration and Validation Rules"
+sidebarTitle: "Risk Outline"
+description: "Full reference for the RiskOutline agent-swarm-kit outline: history construction, zod format, five validation rules, and the dump callback."
+---
+
+The `RiskOutline` is the central decision-making unit in the pipeline. It receives a Telegram channel signal — symbol, direction, targets, and stop-loss — and asks a local Ollama LLM whether to follow or skip it. The decision is based on two hard empirical rules derived from 24-hour pre-computed metrics, not on the LLM's intuition. Candle data from two timeframe advisors is injected purely for the LLM's audit fields (`sure_level` and `confidence`), which feed the post-analysis dump but never influence the `action` field.
+
+## Registration
+
+The outline is registered via `addOutline<RiskOutlineContract>` from `agent-swarm-kit`:
+
+```typescript
+import { addOutline, ask, dumpOutlineResult, IOutlineHistory } from 'agent-swarm-kit';
+import { zodResponseFormat } from "openai/helpers/zod";
+import { OutlineName } from '../../enum/OutlineName';
+import { CompletionName } from '../../enum/CompletionName';
+import { RiskOutlineContract, RiskOutlineFormat } from '../../contract/RiskOutline';
+
+addOutline<RiskOutlineContract>({
+  outlineName: OutlineName.RiskOutline,              // "risk_outline"
+  completion: CompletionName.OllamaOutlineToolCompletion,
+  format: zodResponseFormat(RiskOutlineFormat, "risk_assessment"),
+  getOutlineHistory: async ({ history }, symbol, direction, targets, stoploss) => { ... },
+  validations: [...],
+  callbacks: { onValidDocument: async (result) => { ... } },
+});
+```
+
+<CardGroup cols={3}>
+  <Card title="outlineName" icon="tag">
+    `OutlineName.RiskOutline` = `"risk_outline"`
+  </Card>
+  <Card title="completion" icon="brain">
+    `CompletionName.OllamaOutlineToolCompletion`
+  </Card>
+  <Card title="format" icon="code">
+    `zodResponseFormat(RiskOutlineFormat, "risk_assessment")`
+  </Card>
+</CardGroup>
+
+## Zod Response Format (`RiskOutlineFormat`)
+
+The zod schema defined in `src/contract/RiskOutline.ts` is passed directly to `zodResponseFormat` to generate an OpenAI-compatible JSON schema. It is the source of truth for both the LLM's output shape and the five runtime validations.
+
+```typescript
+import { z } from "zod";
+
+export const RiskOutlineFormat = z.object({
+  action: z.enum(["skip", "follow"]),
+  sure_level: z.enum(["low", "low_medium", "medium", "medium_high", "high"]),
+  confidence: z.enum(["reliable", "not_reliable"]),
+  description: z.string(),
+  reasoning: z.string(),
+});
+
+export type RiskOutlineContract = z.infer<typeof RiskOutlineFormat>;
+```
+
+<ResponseField name="action" type='"skip" | "follow"' required>
+  The trading decision. `"follow"` opens a position in the signal's direction; `"skip"` discards the signal entirely. Determined exclusively by the two metric rules — never by `sure_level` or `confidence`.
+</ResponseField>
+
+<ResponseField name="sure_level" type='"low" | "low_medium" | "medium" | "medium_high" | "high"' required>
+  Audit-only field. The LLM's assessment of accumulation / manipulation evidence in the candle data.
+
+  <Expandable title="Level definitions">
+    | Value | Meaning |
+    |---|---|
+    | `low` | No signs; volume structure is organic |
+    | `low_medium` | One fresh anomaly without price displacement |
+    | `medium` | One anomaly (old, or with price displacement) |
+    | `medium_high` | Repeated accumulation pattern |
+    | `high` | Multiple accumulation events with clear price displacement |
+  </Expandable>
+</ResponseField>
+
+<ResponseField name="confidence" type='"reliable" | "not_reliable"' required>
+  Audit-only field. Data reliability rating. `"reliable"` when ≥ 60 one-minute candles are available and metrics are unambiguous; `"not_reliable"` otherwise.
+</ResponseField>
+
+<ResponseField name="description" type="string" required>
+  A 2–3 sentence verdict for the trader, naming the triggered rule and the exact metric values. Minimum 30 characters enforced at runtime.
+</ResponseField>
+
+<ResponseField name="reasoning" type="string" required>
+  A flat string of step-by-step reasoning, steps separated by `\n`. Must not be a JSON object or array. Minimum 80 characters enforced at runtime.
+</ResponseField>
+
+## Constants
+
+```typescript
+const PRE_CANDLES_LIMIT = 1440;          // 24 h of 1m candles for metrics
+const SHORT_MIN_AVG_RANGE_PCT = 0.07;    // Rule 1 threshold
+const LONG_MIN_MOMENTUM_24H_PCT = -1;    // Rule 2 threshold
+```
+
+<CardGroup cols={3}>
+  <Card title="PRE_CANDLES_LIMIT" icon="clock">
+    **1440** — 24 hours of 1-minute candles fetched to compute `avgRangePct` and `momentum24hPct`.
+  </Card>
+  <Card title="SHORT_MIN_AVG_RANGE_PCT" icon="arrow-down">
+    **0.07 %** — SHORT signals on assets below this average range are skipped (sleeping-coin stop-hunt rule).
+  </Card>
+  <Card title="LONG_MIN_MOMENTUM_24H_PCT" icon="chart-line">
+    **−1 %** — LONG signals on assets whose 24 h momentum is below this threshold are skipped (knife-catching rule).
+  </Card>
+</CardGroup>
+
+## `getOutlineHistory` — Message Construction
+
+The `getOutlineHistory` function receives `{ history }` (the mutable `IOutlineHistory` object) plus four positional arguments: `symbol`, `direction`, `targets`, and `stoploss`. It builds the conversation context in a strict order before the LLM is invoked.
+
+<Steps>
+  <Step title="System prompt">
+    Pushes the `RISK_PROMPT` string as a `system` role message. The prompt explains the two decision rules, the five audit levels, the expected output format, and strict instructions not to use intuition or re-compute pre-computed metrics.
+
+    ```typescript
+    await history.push({ role: 'system', content: RISK_PROMPT });
+    ```
+  </Step>
+
+  <Step title="1-minute candle history (commitOneMinuteHistory)">
+    Calls `ask(symbol, AdvisorName.StockData1mAdvisor)` which invokes `StockData1mAdvisor` and returns a markdown table of the last **240** 1m candles (4 hours). Pushes a user/assistant exchange:
+
+    ```typescript
+    await history.push(
+      { role: "user", content: "Прочитай последние минутные свечи и скажи OK\n\n" + report },
+      { role: "assistant", content: "OK" },
+    );
+    ```
+
+    Throws `"StockData1mAdvisor failed"` if the advisor returns a falsy value.
+  </Step>
+
+  <Step title="15-minute candle history (commitFifteenMinuteHistory)">
+    Calls `ask(symbol, AdvisorName.StockData15mAdvisor)` which returns a markdown table of the last **32** 15m candles (8 hours). Follows the same push pattern:
+
+    ```typescript
+    await history.push(
+      { role: "user", content: "Прочитай последние свечи пятнадцать минут и скажи OK\n\n" + report },
+      { role: "assistant", content: "OK" },
+    );
+    ```
+
+    Throws `"StockData15mAdvisor failed"` if the advisor returns a falsy value.
+  </Step>
+
+  <Step title="Pre-computed metrics (commitMetricsHistory)">
+    Fetches `PRE_CANDLES_LIMIT` (1440) 1m candles via `getCandles(symbol, "1m", 1440)` and computes two aggregate metrics:
+
+    ```typescript
+    const avgRangePct =
+      candles.reduce((acc, c) => acc + ((c.high - c.low) / c.close) * 100, 0)
+      / candles.length;
+
+    const momentum24hPct =
+      ((candles[candles.length - 1].close - candles[0].open) / candles[0].open) * 100;
+    ```
+
+    These are pushed as a user/assistant pair so the LLM reads them as pre-computed facts:
+
+    ```
+    avgRangePct: 0.0523%
+    momentum24hPct: -2.14%
+    candlesCount: 1440
+    ```
+
+    <Note>
+      The LLM is explicitly instructed **not** to re-derive these numbers. Rule evaluation is always performed against the values reported in this message.
+    </Note>
+  </Step>
+
+  <Step title="Draft signal (commitDraftSignal)">
+    Pushes the raw Telegram signal as a user/assistant pair so the LLM can read the direction and levels it must evaluate:
+
+    ```typescript
+    await history.push([
+      {
+        role: "user",
+        content:
+          "Прочитай DRAFT СИГНАЛ ДЛЯ ПРОВЕРКИ\n\n" +
+          `Символ: ${symbol}\n` +
+          `Позиция: ${direction.toUpperCase()}\n` +
+          `Targets: ${targets.map(v => `${v.toFixed(6)} USD`).join(", ")}\n` +
+          `Hard Stop: ${stoploss.toFixed(6)} USD`,
+      },
+      { role: "assistant", content: "Draft сигнал получен." },
+    ]);
+    ```
+  </Step>
+
+  <Step title="Final instruction message">
+    Closes the history with the production request:
+
+    ```typescript
+    await history.push({
+      role: 'user',
+      content:
+        "Применяй правила из system prompt буквально по pre-computed метрикам.\n" +
+        "Верни action, sure_level, confidence, description, reasoning.",
+    });
+    ```
+  </Step>
+</Steps>
+
+## The Two Decision Rules
+
+The LLM prompt encodes three rules. Rules 1 and 2 can each fire a `"skip"`. Rule 3 is the default.
+
+<CardGroup cols={1}>
+  <Card title="Rule 1 — Sleeping-Coin SHORT" icon="moon">
+    **Condition:** `direction = SHORT` **AND** `avgRangePct < 0.07 %`
+
+    **Action:** `"skip"`
+
+    A low-volatility asset ("sleeping coin") is a stop-hunt target. A single large candle from a market-maker will sweep short stops upward.
+  </Card>
+  <Card title="Rule 2 — Knife-Catching LONG" icon="knife">
+    **Condition:** `direction = LONG` **AND** `momentum24hPct < -1 %`
+
+    **Action:** `"skip"`
+
+    A LONG signal on a market in downward momentum means buyers enter on the way down; the stop is almost certain to be hit.
+  </Card>
+  <Card title="Rule 3 — Default Follow" icon="check">
+    **Condition:** Neither Rule 1 nor Rule 2 fired.
+
+    **Action:** `"follow"`
+  </Card>
+</CardGroup>
+
+<Warning>
+  `sure_level` and `confidence` are **audit-only** fields. They document the LLM's candle interpretation for post-analysis but must never influence the `action` decision. The prompt instructs the model explicitly: "action НЕ ЗАВИСИТ от sure_level и confidence."
+</Warning>
+
+## Validations
+
+All five validations run against the parsed LLM response before `onValidDocument` is called. Any failure causes the outline to retry.
+
+```typescript
+validations: [
+  {
+    validate: ({ data }) => {
+      const ACTIONS = ["skip", "follow"];
+      if (!ACTIONS.includes(data.action)) {
+        throw new Error(`action "${data.action}" вне допустимого набора ${ACTIONS.join(", ")}`);
+      }
+    },
+    docDescription: "Проверяет, что action — skip или follow.",
+  },
+  {
+    validate: ({ data }) => {
+      const SURE_LEVELS = ["low", "low_medium", "medium", "medium_high", "high"];
+      if (!SURE_LEVELS.includes(data.sure_level)) {
+        throw new Error(`sure_level "${data.sure_level}" вне допустимого набора ${SURE_LEVELS.join(", ")}`);
+      }
+    },
+    docDescription: "Проверяет, что sure_level — один из пяти допустимых уровней.",
+  },
+  {
+    validate: ({ data }) => {
+      if (data.confidence !== "reliable" && data.confidence !== "not_reliable") {
+        throw new Error(`confidence "${data.confidence}" должен быть reliable или not_reliable`);
+      }
+    },
+    docDescription: "Проверяет, что confidence — reliable или not_reliable.",
+  },
+  {
+    validate: ({ data }) => {
+      if (typeof data.description !== "string" || data.description.trim().length < 30) {
+        throw new Error(`description слишком короткий (${data.description?.length ?? 0} симв.)`);
+      }
+    },
+    docDescription: "Проверяет, что description содержит полноценный вердикт (>= 30 символов).",
+  },
+  {
+    validate: ({ data }) => {
+      if (typeof data.reasoning !== "string" || data.reasoning.trim().length < 80) {
+        throw new Error(`reasoning слишком короткий (${data.reasoning?.length ?? 0} симв.)`);
+      }
+    },
+    docDescription: "Проверяет, что reasoning содержит обоснование шагов (>= 80 символов).",
+  },
+],
+```
+
+<Tabs>
+  <Tab title="Validation 1 — action">
+    **Field:** `action`
+
+    **Rule:** Must be exactly `"skip"` or `"follow"`.
+
+    **Error:** `action "X" вне допустимого набора skip, follow`
+  </Tab>
+  <Tab title="Validation 2 — sure_level">
+    **Field:** `sure_level`
+
+    **Rule:** Must be one of `"low"`, `"low_medium"`, `"medium"`, `"medium_high"`, `"high"`.
+
+    **Error:** `sure_level "X" вне допустимого набора low, low_medium, medium, medium_high, high`
+  </Tab>
+  <Tab title="Validation 3 — confidence">
+    **Field:** `confidence`
+
+    **Rule:** Must be `"reliable"` or `"not_reliable"`.
+
+    **Error:** `confidence "X" должен быть reliable или not_reliable`
+  </Tab>
+  <Tab title="Validation 4 — description length">
+    **Field:** `description`
+
+    **Rule:** Must be a string of at least **30** characters after trimming.
+
+    **Error:** `description слишком короткий (N симв.), нужен полноценный вердикт`
+  </Tab>
+  <Tab title="Validation 5 — reasoning length">
+    **Field:** `reasoning`
+
+    **Rule:** Must be a string of at least **80** characters after trimming.
+
+    **Error:** `reasoning слишком короткий (N симв.), ожидается пошаговое обоснование`
+  </Tab>
+</Tabs>
+
+## `onValidDocument` Callback
+
+After all validations pass, `onValidDocument` writes the result to disk using `dumpOutlineResult` from `agent-swarm-kit`:
+
+```typescript
+callbacks: {
+  async onValidDocument(result) {
+    if (!result.data) {
+      return;
+    }
+    await dumpOutlineResult(result, './dump/outline/risk');
+  },
+},
+```
+
+The dump directory `./dump/outline/risk` accumulates one JSON file per validated call, enabling offline backtesting and performance analysis without a live exchange connection.
+
+## `runRiskOutline` Global
+
+`src/func/risk.function.ts` exposes `runRiskOutline` on `globalThis` so the outline can be invoked interactively (e.g. from a Node.js REPL or a one-off script) outside the live 15-minute crontab pipeline.
+
+```typescript
+interface RiskOutlineParams {
+  symbol: string;
+  publishedAt: Date;
+  exchangeName: string;
+  direction: "short" | "long";
+  targets: number[];
+  stoploss: number;
+}
+
+function runRiskOutlineFn({
+  symbol,
+  direction,
+  targets,
+  stoploss,
+  publishedAt,
+  exchangeName,
+}: RiskOutlineParams) {
+  const when = alignToInterval(publishedAt, "1m");
+  return runInMockContext(
+    async () => {
+      const { data, error, isValid } = await json<RiskOutlineContract>(
+        OutlineName.RiskOutline,
+        symbol,
+        direction,
+        targets,
+        stoploss,
+      );
+      if (!isValid) {
+        throw new Error(error);
+      }
+      return data;
+    },
+    {
+      symbol,
+      exchangeName,
+      when,
+      strategyName: "mock-strategy",
+      frameName: "mock-frame",
+      backtest: true,
+    },
+  );
+}
+
+declare global {
+  var runRiskOutline: typeof runRiskOutlineFn;
+}
+
+Object.assign(globalThis, { runRiskOutline: runRiskOutlineFn });
+```
+
+<ParamField path="symbol" type="string" required>
+  Trading pair symbol, e.g. `"BTCUSDT"`.
+</ParamField>
+<ParamField path="publishedAt" type="Date" required>
+  Original publication timestamp of the Telegram signal. Passed to `alignToInterval(publishedAt, "1m")` to snap it to the nearest 1-minute boundary before the mock context is constructed.
+</ParamField>
+<ParamField path="exchangeName" type="string" required>
+  Exchange identifier used to resolve candle data in the mock context, e.g. `"binance"`.
+</ParamField>
+<ParamField path="direction" type='"short" | "long"' required>
+  Signal direction from the Telegram channel.
+</ParamField>
+<ParamField path="targets" type="number[]" required>
+  Array of take-profit price levels in USD.
+</ParamField>
+<ParamField path="stoploss" type="number" required>
+  Hard stop-loss price level in USD.
+</ParamField>
+
+**Usage example from a Node.js REPL:**
+
+```typescript
+const result = await globalThis.runRiskOutline({
+  symbol: "BTCUSDT",
+  publishedAt: new Date("2024-11-15T14:30:00Z"),
+  exchangeName: "binance",
+  direction: "short",
+  targets: [91500.000000, 90800.000000],
+  stoploss: 93200.000000,
+});
+
+console.log(result);
+// {
+//   action: "skip",
+//   sure_level: "medium_high",
+//   confidence: "reliable",
+//   description: "Action skip. SHORT на спящем активе (avgRangePct 0.045% < 0.07%) — stop-hunt мишень.",
+//   reasoning: "Шаг 1: avgRangePct=0.045%, momentum24hPct=1.18%\nШаг 2: direction=SHORT И avgRangePct < 0.07% → правило 1 → action=skip\nШаг 3: sure_level=medium_high, confidence=reliable"
+// }
+```
+
+<Tip>
+  `runInMockContext` rewinds time to `when` so all `getCandles` calls inside the outline fetch historical data anchored to the signal's publication moment — identical to what the live crontab would have seen at that instant. Set `backtest: true` to suppress live exchange calls.
+</Tip>

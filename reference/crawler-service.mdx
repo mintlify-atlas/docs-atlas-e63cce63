@@ -1,0 +1,339 @@
+---
+title: "CrawlerService and CrawlerMainService Reference"
+sidebarTitle: "CrawlerService"
+description: "API reference for CrawlerService (day/range crawls) and CrawlerMainService (live and backtest frame coordination), accessible via core.crawlerMainService."
+---
+
+`CrawlerService` and `CrawlerMainService` form the data-ingestion backbone of the pipeline. `CrawlerService` handles the raw work of fetching and persisting Telegram messages for one or many calendar days, while `CrawlerMainService` coordinates those crawls within the live-crontab and backtest execution contexts and fires the downstream `signalJobSubject` emitter once new data is available. A third collaborator, `CryptoYodaScreenService`, bridges the scraper and parser layers for the `crypto_yoda_channel` source with its Russian-language regex format.
+
+---
+
+## CrawlerService
+
+`CrawlerService` is registered under `TYPES.crawlerService` in the DI container and is accessible on the core service object as `core.crawlerService`. It exposes two public methods that ultimately fan out to `CryptoYodaScreenService.screenDay` per day and upsert results to MongoDB via `ParserDbService`.
+
+```typescript
+import { CrawlerService } from "@core/lib/services/core/CrawlerService";
+// Resolved via DI — do not instantiate directly
+// const crawlerService = inject<CrawlerService>(TYPES.crawlerService);
+```
+
+### Methods
+
+#### `crawlDay`
+
+Crawls a single calendar day identified by a `MomentStamp` integer (the integer representation from the `get-moment-stamp` package).
+
+```typescript
+public crawlDay(stamp: number): Promise<ScreenItem[]>
+```
+
+Internally calls `crawlRange(stamp, stamp)`, which delegates to `RUN_CRAWLER_FN`.
+
+<ParamField path="stamp" type="number" required>
+  A `MomentStamp` integer representing the target calendar day. Obtain the
+  value with `getMomentStamp(date: Date)` from `get-moment-stamp`.
+</ParamField>
+
+<ResponseField name="ScreenItem[]" type="ParserMessage[]">
+  A flat array of parsed channel messages for the day. Each item carries the
+  `ScraperMessage` base fields plus a `data` object (or `null` if parsing
+  failed) and a `type` discriminant set to `"crypto_yoda_channel"`.
+</ResponseField>
+
+---
+
+#### `crawlRange`
+
+Crawls an inclusive range of calendar days in parallel, upserts every successfully parsed message to the `parser-items` collection, and returns the combined result list.
+
+```typescript
+public crawlRange(fromStamp: number, toStamp: number): Promise<ScreenItem[]>
+```
+
+<ParamField path="fromStamp" type="number" required>
+  Start of the date range as a `MomentStamp` integer (inclusive).
+</ParamField>
+
+<ParamField path="toStamp" type="number" required>
+  End of the date range as a `MomentStamp` integer (inclusive). Must be ≥
+  `fromStamp`.
+</ParamField>
+
+<ResponseField name="ScreenItem[]" type="ParserMessage[]">
+  Combined flat array of parsed messages across all days in the range.
+  Messages whose `data` field is `null` are skipped during DB upsert but are
+  still included in the return value.
+</ResponseField>
+
+<Note>
+  `crawlRange` skips upsert for messages where `msg.data` is `null` (i.e.
+  parsing failed). It logs the skip at `info` level with the channel name,
+  message ID, and raw content. Successfully parsed messages of type
+  `"crypto_yoda_channel"` are upserted via `parserDbService.create()` using a
+  `{ channel, messageId }` compound filter so re-running the same range is
+  always safe.
+</Note>
+
+### Internal: `RUN_CRAWLER_FN`
+
+```typescript
+const RUN_CRAWLER_FN = async <F extends readonly ScreenDayFn[]>(
+  fromStamp: number,
+  toStamp: number,
+  ...screenDayList: F
+): Promise<ScreenItem<F[number]>[]>
+```
+
+Iterates each integer stamp value from `fromStamp` through `toStamp`, converts each to a `Date` via `fromMomentStamp(stamp)`, calls every `screenDayFn` with that date, collects all resulting promises, and resolves them together with `Promise.all`. The results are flat-mapped into a single array.
+
+<Tip>
+  Because `RUN_CRAWLER_FN` uses `Promise.all`, every channel × day combination
+  executes concurrently. For large date ranges this can produce many simultaneous
+  Telegram API requests — consider keeping ranges to a few weeks at most during
+  backtest setup.
+</Tip>
+
+### DB Upsert Shape
+
+When `msg.type === "crypto_yoda_channel"` and `msg.data !== null`, the following object is written to `parser-items`:
+
+```typescript
+{
+  channel:     msg.channel,        // "crypto_yoda_channel"
+  source:      msg.channel,
+  messageId:   msg.id,             // Telegram message ID (number)
+  publishedAt: msg.date,           // Date of the original Telegram post
+  note:        msg.content,        // Raw message text stored as a note
+  symbol:      `${msg.data.symbol}USDT`,
+  direction:   msg.data.direction, // "long" | "short"
+  entry:       msg.data.entry,     // { from: number; to: number }
+  targets:     msg.data.targets,   // number[]
+  stoploss:    msg.data.stoploss,  // number
+  content:     msg.data,           // Full parsed data object (Mixed)
+}
+```
+
+---
+
+## CrawlerMainService
+
+`CrawlerMainService` is registered under `TYPES.crawlerMainService` and is the entry point called by the 15-minute crontab. It reads the execution mode from `backtest-kit`, delegates to `CrawlerService`, and signals the job pipeline via `signalJobSubject`.
+
+```typescript
+import { CrawlerMainService } from "@core/lib/services/main/CrawlerMainService";
+// const crawlerMainService = inject<CrawlerMainService>(TYPES.crawlerMainService);
+```
+
+### Methods
+
+#### `crawlLiveFrame`
+
+Executes a single-day crawl for use by the live crontab trigger.
+
+```typescript
+public crawlLiveFrame(when: Date): Promise<void>
+```
+
+<ParamField path="when" type="Date" required>
+  The current wall-clock moment. `getMomentStamp(when)` is used to derive
+  today's stamp. Typically `new Date()` when called from the crontab handler.
+</ParamField>
+
+**Execution flow:**
+
+<Steps>
+  <Step title="Guard: backtest mode check">
+    Calls `getMode()` from `backtest-kit`. If the result is `"backtest"`,
+    returns immediately without crawling — backtest frames are driven by
+    `crawlBacktestFrame` instead.
+  </Step>
+  <Step title="Derive today's stamp">
+    Computes `stamp = getMomentStamp(when)` to get the integer day identifier.
+  </Step>
+  <Step title="Crawl the day">
+    Delegates to `crawlerService.crawlDay(stamp)`, which fans out to
+    `CryptoYodaScreenService.screenDay` and upserts results.
+  </Step>
+  <Step title="Fire the job emitter">
+    Calls `signalJobSubject.next()` so `SignalJobService` picks up the new
+    `parser-items` rows for LLM processing.
+  </Step>
+</Steps>
+
+<Warning>
+  `crawlLiveFrame` silently returns when `mode === "backtest"`. Do not use it
+  to seed backtest data — call `crawlBacktestFrame` instead.
+</Warning>
+
+---
+
+#### `crawlBacktestFrame`
+
+Crawls the full date range of the current backtest frame and then fires the job emitter.
+
+```typescript
+public crawlBacktestFrame(when: Date): Promise<void>
+```
+
+<ParamField path="when" type="Date" required>
+  Passed for logging purposes. The actual date range is read from the current
+  backtest frame schema, not from `when` directly.
+</ParamField>
+
+**Execution flow:**
+
+<Steps>
+  <Step title="Resolve the active frame">
+    Calls `getContext()` to obtain `frameName`, then `listFrameSchema()` to
+    find the matching frame entry containing `startDate` and `endDate`.
+  </Step>
+  <Step title="Convert dates to stamps">
+    Converts `startDate` and `endDate` to `MomentStamp` integers via
+    `getMomentStamp()`.
+  </Step>
+  <Step title="Crawl the full range">
+    Calls `crawlerService.crawlRange(fromStamp, toStamp)` to collect all
+    channel messages for every day in the frame.
+  </Step>
+  <Step title="Fire the job emitter">
+    Calls `signalJobSubject.next()` to trigger LLM screening of the ingested
+    rows.
+  </Step>
+</Steps>
+
+---
+
+## CryptoYodaScreenService
+
+`CryptoYodaScreenService` is registered under `TYPES.cryptoYodaScreenService`. It owns the channel constant, the regex format map, and coordinates between `ScraperService` and `ParserService` for the `crypto_yoda_channel` Telegram source.
+
+```typescript
+import { CryptoYodaScreenService } from "@core/lib/services/screen/CryptoYodaScreenService";
+// const cryptoYodaScreenService = inject<CryptoYodaScreenService>(TYPES.cryptoYodaScreenService);
+```
+
+### Methods
+
+#### `screenDay`
+
+Top-level method called by `RUN_CRAWLER_FN`. Scrapes the channel for the given date and returns fully parsed messages.
+
+```typescript
+public screenDay(date: Date): Promise<ParserMessage<typeof SIGNAL_FORMAT, "crypto_yoda_channel">[]>
+```
+
+<ParamField path="date" type="Date" required>
+  The calendar day to scrape. UTC midnight and 23:59:59.999 boundaries are
+  applied by `ScraperService.scrapeDay` internally.
+</ParamField>
+
+**Calls** `scraperService.scrapeDay("crypto_yoda_channel", date)` then passes the result to `parseDay`.
+
+---
+
+#### `parseDay`
+
+Applies `ParserService.parseDay` with the channel-specific `SIGNAL_FORMAT` and stamps every message with `type: "crypto_yoda_channel"`.
+
+```typescript
+public parseDay(
+  scraperList: ScraperMessage[]
+): Promise<ParserMessage<typeof SIGNAL_FORMAT, "crypto_yoda_channel">[]>
+```
+
+<ParamField path="scraperList" type="ScraperMessage[]" required>
+  Raw messages returned by `ScraperService.scrapeDay`. Each item has `id`,
+  `channel`, `content`, and `date`.
+</ParamField>
+
+---
+
+### `SIGNAL_FORMAT` — Regex Map
+
+`SIGNAL_FORMAT` is the `ParseFormat<SignalFields>` object that defines how each field is extracted from raw Russian-language Telegram posts. All patterns are passed to `ParserService.EXTRACT_DATA_FN`.
+
+```typescript
+type SignalFields = {
+  symbol:    string;
+  direction: "short" | "long";
+  entry:     { from: number; to: number };
+  targets:   number[];
+  stoploss:  number;
+};
+```
+
+<Expandable title="Full SIGNAL_FORMAT definition">
+
+```typescript
+const SIGNAL_FORMAT: ParseFormat<SignalFields> = {
+  symbol: {
+    pattern:  /#([A-Z0-9]+)\/USDT/,
+    group:    1,
+    validate: (v) => v.length > 0,
+  },
+
+  direction: {
+    pattern:   /(ШОРТ|ЛОНГ)/i,
+    transform: (raw) => (raw.toUpperCase() === "ШОРТ" ? "short" : "long"),
+    validate:  (v) => v === "short" || v === "long",
+  },
+
+  entry: {
+    // Matches price zones such as "в зоне $1.23 - $1.45" or "в зоне 1,23 – 1,45"
+    pattern:   /зоне\s+\$?([\d.,]+)\s*[-–—]\s*(?:\$?[\d.,]+\s*[-–—]\s*)?\$?([\d.,]+)(?=\s)/i,
+    transform: (_, m) => ({ from: parseFloat(m[1].replace(",", ".")),
+                             to:   parseFloat(m[2].replace(",", ".")) }),
+    validate:  (v) => isFinite(v.from) && v.from > 0 &&
+                      isFinite(v.to)   && v.to > 0 &&
+                      v.from < v.to,
+  },
+
+  targets: {
+    // Global flag → multi mode; matches every "Закрыть ордер по цене $X.XX" line
+    pattern:   /Закрыть(?:\s+ордер)?\s+по(?:\s+цене)?\s+\$?([\d.,]+)/gi,
+    transform: (_, m) => parseFloat(m[1].replace(",", ".")),
+    validate:  (v) => isFinite(v) && v > 0,
+    multi:     true,
+  },
+
+  stoploss: {
+    pattern:   /СТОП-?ЛОСС:\s*\$?([\d.,]+)/i,
+    transform: (_, m) => parseFloat(m[1].replace(",", ".")),
+    validate:  (v) => isFinite(v) && v > 0,
+  },
+};
+```
+
+</Expandable>
+
+<Note>
+  The `targets` field uses `multi: true` with a global regex (`/gi`). The
+  parser will call `text.matchAll(pattern)` and collect every capture into a
+  `number[]`. If zero matches are found and `optional` is not set, the entire
+  message is parsed as `null`.
+</Note>
+
+---
+
+## Service Dependency Graph
+
+```
+CrawlerMainService
+  └─ CrawlerService
+       ├─ CryptoYodaScreenService
+       │    ├─ ScraperService       (Telegram API via gramjs)
+       │    └─ ParserService        (regex extraction)
+       └─ ParserDbService           (MongoDB upsert → parser-items)
+```
+
+<CardGroup cols={2}>
+  <Card title="SignalJobService" icon="bolt" href="/reference/signal-job-service">
+    Subscribes to `signalJobSubject` and processes the rows that
+    `CrawlerService` writes to `parser-items`.
+  </Card>
+  <Card title="ParserService" icon="code" href="/reference/parser-service">
+    The generic regex engine used by `CryptoYodaScreenService.parseDay` under
+    the hood.
+  </Card>
+</CardGroup>

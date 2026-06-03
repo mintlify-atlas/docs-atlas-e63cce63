@@ -1,0 +1,222 @@
+---
+title: "January 2026 Backtest: LLM Filter Adds +16.68pp PnL"
+sidebarTitle: "Backtest Report"
+description: "Full trade-by-trade backtest results for January 2026, comparing the baseline signal strategy against the Ollama-gated version."
+---
+
+The January 2026 backtest ran two identical passes over the same parsed-signal set: one where every signal the parser accepted was executed immediately, and one where each signal first had to survive a veto check from a local Ollama LLM (`gpt-oss` quantized). The LLM evaluates candle-derived metrics — `avgRangePct` and `momentum24hPct` — against hard thresholds embedded in a system prompt, then returns a `riskAction: "skip" | "follow"` verdict. Both runs share the same entry price, take-profit (TP3), and stop-loss as configured in the strategy; the only difference is whether the LLM gate was active.
+
+<Note>
+  The LLM rules are fully deterministic. Given the same historical candle data, the same `avgRangePct` and `momentum24hPct` values are computed, and the same `riskAction` verdict is always produced. There are no stochastic or temperature-dependent components in the risk outline — results are 100 % reproducible from the raw OHLCV cache.
+</Note>
+
+---
+
+## Summary: Baseline vs. Ollama
+
+The headline result is a **+16.68 percentage-point improvement in total PnL** by skipping just five signals out of twenty-two.
+
+| Metric | Without Ollama | With Ollama | Δ |
+|---|---|---|---|
+| Total trades | 22 | 17 | **−5 trades skipped** |
+| Total PnL | +52.22% | **+68.90%** | **+16.68 pp** |
+| Winrate | 68% | **82%** | **+14 pp** |
+| Wins / Losses | 15 / 7 | 14 / 3 | **−4 losing trades** |
+| Sharpe Ratio | +0.309 | **+0.512** | **+0.203** |
+| Profit factor | 2.73 | **6.37** | **+3.64** |
+| Expectancy per trade | +$2.37 | **+$4.05** | **+$1.68** (per $100 stake) |
+
+<CardGroup cols={3}>
+  <Card title="+16.68 pp PnL" icon="chart-line">
+    Total return jumps from **+52.22%** to **+68.90%** over the same January 2026 period.
+  </Card>
+  <Card title="Winrate: 68% → 82%" icon="bullseye">
+    Four fewer losing trades dropped the loss count from 7 to 3.
+  </Card>
+  <Card title="Profit Factor: 2.73 → 6.37" icon="scale-balanced">
+    Each dollar risked now returns **$6.37** in gross profit vs. **$2.73** without the filter.
+  </Card>
+</CardGroup>
+
+---
+
+## Trade Log: Without Ollama (22 Trades)
+
+All 22 signals executed in sequence. Seven ended at the stop-loss.
+
+| # | Symbol | Opened (UTC) | Closed (UTC) | Held | Dir | Open | Close | Peak | DD | PNL% | Exit |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| 1 | SOL | Jan 05 07:13 | Jan 05 20:09 | 12.9h | LONG | $135.23 | $139.10 | +2.42% | −1.72% | **+2.45%** | take-profit |
+| 2 | NEAR | Jan 06 08:46 | Jan 06 11:44 | 3.0h | LONG | $1.77 | $1.80 | +1.57% | −0.59% | **+1.64%** | take-profit |
+| 3 | HYPE | Jan 06 09:59 | Jan 06 12:13 | 2.2h | LONG | $26.52 | $27.04 | +1.55% | −1.41% | **+1.56%** | take-profit |
+| 4 | TRX | Jan 06 10:17 | Jan 11 00:06 | 109.8h | SHORT | $0.2915 | $0.3027 | −0.32% | −4.21% | **−4.24%** | stop-loss |
+| 5 | FARTCOIN | Jan 06 10:43 | Jan 17 23:50 | 277.1h | SHORT | $0.4401 | $0.3500 | +19.34% | −7.64% | **+20.13%** | take-profit |
+| 6 | NEAR | Jan 06 19:10 | Jan 06 20:47 | 1.6h | LONG | $1.76 | $1.80 | +1.66% | −0.71% | **+1.81%** | take-profit |
+| 7 | NEAR | Jan 07 13:28 | Jan 08 06:15 | 16.8h | LONG | $1.76 | $1.69 | −0.38% | −4.09% | **−4.26%** | stop-loss |
+| 8 | NEAR | Jan 09 15:23 | Jan 12 13:45 | 70.4h | SHORT | $1.69 | $1.66 | +1.19% | −4.93% | **+1.28%** | take-profit |
+| 9 | PUMP | Jan 10 14:13 | Jan 14 16:12 | 98.0h | LONG | $0.002381 | $0.002930 | +21.10% | −5.42% | **+22.58%** | take-profit |
+| 10 | TRX | Jan 12 13:09 | Jan 15 17:07 | 76.0h | SHORT | $0.2979 | $0.3099 | −0.29% | −4.43% | **−4.45%** | stop-loss |
+| 11 | BTC | Jan 13 11:31 | Jan 13 15:59 | 4.5h | LONG | $92,202.22 | $93,400.00 | +0.81% | −0.71% | **+0.90%** | take-profit |
+| 12 | HYPE | Jan 13 17:21 | Jan 13 22:14 | 4.9h | LONG | $24.46 | $25.19 | +2.44% | −0.40% | **+2.59%** | take-profit |
+| 13 | SOL | Jan 15 13:55 | Jan 18 23:46 | 81.8h | LONG | $145.20 | $139.10 | −0.14% | −4.58% | **−4.59%** | stop-loss |
+| 14 | TRX | Jan 16 17:59 | Jan 17 14:15 | 20.3h | LONG | $0.3080 | $0.3144 | +1.66% | −0.61% | **+1.66%** | take-profit |
+| 15 | SOL | Jan 19 05:26 | Jan 20 08:07 | 26.7h | SHORT | $133.50 | $130.40 | +1.88% | −1.56% | **+1.93%** | take-profit |
+| 16 | POL | Jan 21 17:41 | Jan 21 19:59 | 2.3h | LONG | $0.1329 | $0.1376 | +3.11% | −0.40% | **+3.12%** | take-profit |
+| 17 | TRX | Jan 22 09:16 | Jan 28 08:46 | 143.5h | SHORT | $0.2999 | $0.2930 | +1.89% | −4.00% | **+1.89%** | take-profit |
+| 18 | SOL | Jan 22 09:32 | Jan 25 16:01 | 78.5h | LONG | $129.90 | $125.10 | +0.20% | −4.05% | **−4.08%** | stop-loss |
+| 19 | POL | Jan 22 12:26 | Jan 23 14:03 | 25.6h | LONG | $0.1340 | $0.1290 | +0.15% | −4.11% | **−4.15%** | stop-loss |
+| 20 | FARTCOIN | Jan 26 16:21 | Jan 31 14:28 | 118.1h | SHORT | $0.2824 | $0.2300 | +17.97% | −11.99% | **+18.20%** | take-profit |
+| 21 | SOL | Jan 28 22:15 | Jan 29 14:59 | 16.7h | LONG | $125.46 | $120.50 | −0.13% | −4.21% | **−4.34%** | stop-loss |
+| 22 | TRX | Jan 30 12:19 | Jan 31 20:44 | 32.4h | SHORT | $0.2895 | $0.2867 | +1.29% | −2.44% | **+0.58%** | time-exit |
+
+### Statistics: Without Ollama
+
+| Metric | Value |
+|---|---|
+| Total trades | 22 |
+| Total PnL | **+52.22%** |
+| Wins / Losses | 15 / 7 |
+| Winrate | **68%** |
+| Mean trade PnL | **+2.374%** |
+| Std dev per trade | 7.676% |
+| Sharpe Ratio (per-trade) | **+0.309** |
+| Max drawdown (single trade) | −4.59% |
+| Profit factor | **2.73** |
+| Expectancy per trade | **+$2.37** (per $100 stake) |
+
+---
+
+## Trade Log: With Ollama (17 Trades)
+
+Five signals were vetoed. One additional signal (`TRX LONG Jan 15`) was captured only in the Ollama run because the LLM's pass over that candle window surfaced the opportunity. Three stop-losses remain — the LLM cannot eliminate all risk, only improve the odds.
+
+| # | Symbol | Opened (UTC) | Closed (UTC) | Held | Dir | Open | Close | Peak | DD | PNL% | Exit |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| 1 | SOL | Jan 05 07:13 | Jan 05 20:09 | 12.9h | LONG | $135.23 | $139.10 | +2.42% | −1.72% | **+2.45%** | take-profit |
+| 2 | NEAR | Jan 06 08:46 | Jan 06 11:44 | 3.0h | LONG | $1.77 | $1.80 | +1.57% | −0.59% | **+1.64%** | take-profit |
+| 3 | HYPE | Jan 06 09:59 | Jan 06 12:13 | 2.2h | LONG | $26.52 | $27.04 | +1.55% | −1.41% | **+1.56%** | take-profit |
+| 4 | FARTCOIN | Jan 06 10:43 | Jan 17 23:50 | 277.1h | SHORT | $0.4401 | $0.3500 | +19.34% | −7.64% | **+20.13%** | take-profit |
+| 5 | NEAR | Jan 06 19:10 | Jan 06 20:47 | 1.6h | LONG | $1.76 | $1.80 | +1.66% | −0.71% | **+1.81%** | take-profit |
+| 6 | NEAR | Jan 09 15:23 | Jan 12 13:45 | 70.4h | SHORT | $1.69 | $1.66 | +1.19% | −4.93% | **+1.28%** | take-profit |
+| 7 | PUMP | Jan 10 14:13 | Jan 14 16:12 | 98.0h | LONG | $0.002381 | $0.002930 | +21.10% | −5.42% | **+22.58%** | take-profit |
+| 8 | BTC | Jan 13 11:31 | Jan 13 15:59 | 4.5h | LONG | $92,202.22 | $93,400.00 | +0.81% | −0.71% | **+0.90%** | take-profit |
+| 9 | HYPE | Jan 13 17:21 | Jan 13 22:14 | 4.9h | LONG | $24.46 | $25.19 | +2.44% | −0.40% | **+2.59%** | take-profit |
+| 10 | TRX | Jan 15 12:11 | Jan 15 22:35 | 10.4h | LONG | $0.3055 | $0.3124 | +1.86% | −0.49% | **+1.86%** | take-profit |
+| 11 | SOL | Jan 15 13:55 | Jan 18 23:46 | 81.8h | LONG | $145.20 | $139.10 | −0.14% | −4.58% | **−4.59%** | stop-loss |
+| 12 | TRX | Jan 16 17:59 | Jan 17 14:15 | 20.3h | LONG | $0.3080 | $0.3144 | +1.66% | −0.61% | **+1.66%** | take-profit |
+| 13 | SOL | Jan 19 05:26 | Jan 20 08:07 | 26.7h | SHORT | $133.50 | $130.40 | +1.88% | −1.56% | **+1.93%** | take-profit |
+| 14 | POL | Jan 21 17:41 | Jan 21 19:59 | 2.3h | LONG | $0.1329 | $0.1376 | +3.11% | −0.40% | **+3.12%** | take-profit |
+| 15 | SOL | Jan 22 09:32 | Jan 25 16:01 | 78.5h | LONG | $129.90 | $125.10 | +0.20% | −4.05% | **−4.08%** | stop-loss |
+| 16 | POL | Jan 22 12:26 | Jan 23 14:03 | 25.6h | LONG | $0.1340 | $0.1290 | +0.15% | −4.11% | **−4.15%** | stop-loss |
+| 17 | FARTCOIN | Jan 26 16:21 | Jan 31 14:28 | 118.1h | SHORT | $0.2824 | $0.2300 | +17.97% | −11.99% | **+18.20%** | take-profit |
+
+### Statistics: With Ollama
+
+| Metric | Value |
+|---|---|
+| Total trades | 17 |
+| Total PnL | **+68.90%** |
+| Wins / Losses | 14 / 3 |
+| Winrate | **82%** |
+| Mean trade PnL | **+4.053%** |
+| Std dev per trade | 7.918% |
+| Sharpe Ratio (per-trade) | **+0.512** |
+| Max drawdown (single trade) | −4.59% |
+| Profit factor | **6.37** |
+| Expectancy per trade | **+$4.05** (per $100 stake) |
+
+---
+
+## What the LLM Vetoed
+
+The LLM issued **6 veto decisions** in total across the January 2026 signal set. The financial impact breaks down as follows.
+
+<Tabs>
+  <Tab title="Vetoed Losers (saved)">
+
+    Four of the six vetoed signals were stop-loss trades. Skipping them avoided a combined **−17.29%** drawdown.
+
+    | Signal | Date | PnL avoided |
+    |---|---|---|
+    | TRX SHORT | Jan 06 | −4.24% |
+    | NEAR LONG | Jan 07 | −4.26% |
+    | TRX SHORT | Jan 12 | −4.45% |
+    | SOL LONG | Jan 28 | −4.34% |
+    | **Total** | | **−17.29%** |
+
+  </Tab>
+  <Tab title="Vetoed Winners (cost)">
+
+    Two vetoed signals turned out to be profitable. Skipping them cost **−2.47%** in foregone gains.
+
+    | Signal | Date | PnL foregone |
+    |---|---|---|
+    | TRX SHORT | Jan 22 | +1.89% |
+    | TRX SHORT | Jan 30 | +0.58% |
+    | **Total** | | **+2.47%** |
+
+  </Tab>
+  <Tab title="Net Filtering Gain">
+
+    | Item | Value |
+    |---|---|
+    | Losses avoided | +17.29% |
+    | Winners missed | −2.47% |
+    | **Net filtering gain** | **+14.82%** |
+    | Bonus trade captured (TRX LONG Jan 15) | +1.86% |
+
+    The LLM's net contribution to the portfolio is **+14.82%** from filtering alone, plus an additional **+1.86%** from the one trade that only appeared in the Ollama run.
+
+  </Tab>
+</Tabs>
+
+<Tip>
+  The two false-positive vetoes (TRX SHORT Jan 22 and Jan 30) were both thin-range SHORT signals on a low-volatility day — precisely the pattern the LLM is calibrated to flag. In live trading the conservative bias is intentional: the cost of skipping a modest winner is far lower than absorbing a full stop-loss on a stop-hunt setup.
+</Tip>
+
+---
+
+## How the Filter Works
+
+The veto logic lives in [`packages/core/src/logic/outline/risk.outline.ts`](https://github.com/tripolskypetr/backtest-kit/blob/master/packages/core/src/logic/outline/risk.outline.ts). It is not a learned model — it is a set of empirical threshold rules encoded in the LLM system prompt and validated through a Zod schema.
+
+<Accordion title="Key threshold rules (from the system prompt)">
+
+Two computed metrics drive every decision:
+
+- **`avgRangePct`** — the average high-minus-low candle range as a percentage of mid-price, derived from the most recent 1m and 15m candles at signal time.
+- **`momentum24hPct`** — the 24-hour price change expressed as a percentage.
+
+The embedded rules:
+
+```
+Rule 1 (sleeping-coin SHORT veto):
+  if direction == "SHORT" and avgRangePct < 0.07%
+    → riskAction = "skip"
+    rationale: thin candle range indicates a sleeping, illiquid market;
+               a short here is likely a stop-hunt setup.
+
+Rule 2 (falling-knife LONG veto):
+  if direction == "LONG" and momentum24hPct < -1%
+    → riskAction = "skip"
+    rationale: entering a long while the asset is in a 24h downtrend
+               increases the probability of catching a knife.
+```
+
+Both thresholds are tunable in the system-prompt string without touching or recompiling any `packages/` source file.
+
+</Accordion>
+
+The LLM response is validated against a Zod schema that requires:
+
+```typescript
+{
+  riskAction: z.enum(["skip", "follow"]),
+  riskSureLevel: z.number().min(0).max(1),
+  riskConfidence: z.number().min(0).max(1),
+  riskDescription: z.string(),
+  riskReasoning: z.string(),
+}
+```
+
+Only when `riskAction === "follow"` does the strategy open a position.

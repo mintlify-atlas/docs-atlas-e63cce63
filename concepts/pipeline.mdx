@@ -1,0 +1,160 @@
+---
+title: "Signal Pipeline: Telegram Crawl to LLM Veto to Position"
+sidebarTitle: "Pipeline"
+description: "Trace a trading signal from its publication in a Telegram channel through parsing, LLM risk filtering, and strategy execution."
+---
+
+Every trade in `backtest-ollama-crontab` is the result of a deterministic, five-stage assembly line that starts the moment a message lands in a public Telegram signals channel and ends only when a local Ollama model has either blessed or vetoed it. Nothing is opened until all five stages have completed. Understanding this pipeline is the fastest way to understand the entire project.
+
+<Steps>
+
+  <Step title="Crawl — Telegram messages into parser-items">
+    `CrawlerService.crawlDay(stamp)` calls `crawlRange(stamp, stamp)` which drives `CryptoYodaScreenService.screenDay(date)`. That method first calls `ScraperService.scrapeDay(channelName, date)` to pull raw `ScraperMessage` objects from the Telegram MTProto session, then forwards them through `CryptoYodaScreenService.parseDay()` to apply the `SIGNAL_FORMAT` regex map (see Stage 2).
+
+    For each message that yields a valid parsed result with `type === "crypto_yoda_channel"`, `CrawlerService` calls `ParserDbService.create()` to upsert the record into the **`parser-items`** MongoDB collection. Duplicate messages on the same `(channel, messageId)` pair are silently ignored via the unique compound index.
+
+    ```typescript
+    // packages/core/src/lib/services/core/CrawlerService.ts
+    public crawlRange = async (fromStamp: number, toStamp: number) => {
+      const screenList = await RUN_CRAWLER_FN(
+        fromStamp,
+        toStamp,
+        this.cryptoYodaScreenService.screenDay,
+      );
+      for (const msg of screenList) {
+        if (!msg.data) continue;
+        if (msg.type === "crypto_yoda_channel") {
+          await this.parserDbService.create({
+            channel: msg.channel,
+            source: msg.channel,
+            messageId: msg.id,
+            publishedAt: msg.date,
+            note: msg.content,
+            symbol: `${msg.data.symbol}USDT`,
+            direction: msg.data.direction,
+            entry: msg.data.entry,
+            targets: msg.data.targets,
+            stoploss: msg.data.stoploss,
+            content: msg.data,
+          });
+        }
+      }
+    };
+    ```
+  </Step>
+
+  <Step title="Parse — regex extraction of structured signal fields">
+    `CryptoYodaScreenService` delegates to `ParserService.parseDay()` which applies the `SIGNAL_FORMAT` regex map against each raw message string. The map extracts five structured fields from the Telegram message text:
+
+    | Field | Regex pattern | Notes |
+    |---|---|---|
+    | `symbol` | `/#([A-Z0-9]+)\/USDT/` | Captures ticker before `/USDT` |
+    | `direction` | `/(ШОРТ\|ЛОНГ)/i` | Normalised to `"short"` / `"long"` |
+    | `entry` | Range pattern after `"зоне"` keyword | Returns `{ from: number, to: number }` |
+    | `targets` | Repeating `"Закрыть по"` pattern | Multi-match, returns `number[]` |
+    | `stoploss` | `"СТОП-ЛОСС:"` followed by price | Returns single `number` |
+
+    Messages that fail any field's `validate()` predicate are dropped. Only fully-parsed messages reach `parser-items`.
+  </Step>
+
+  <Step title="LLM Risk Gate — Ollama outline veto">
+    `SignalJobService` subscribes to the `signalJobSubject` observable (a `Subject<void>` from `functools-kit`). Whenever `signalJobSubject.next()` fires — after every crawl — `SignalJobService.run()` is invoked through a `queued` wrapper that serialises concurrent calls.
+
+    For each `IParserRow` where `visited === false` (and no matching `screen-items` record exists), the service calls `SignalLogicService.execute(row)` inside an `ExecutionContextService.runInContext(...)` scope that binds `{ symbol, when, backtest }`. `SignalLogicService` calls `json()` from `agent-swarm-kit` against `OutlineName.RiskOutline`, which builds a multi-turn conversation history (1m candles, 15m candles, pre-computed metrics, draft signal) and then calls the local Ollama model to produce a zod-validated `RiskOutlineContract` response.
+
+    ```typescript
+    // packages/core/src/lib/services/job/SignalJobService.ts  (simplified)
+    const RUN_IN_CONTEXT_FN = beginTime(
+      async (self: SignalJobService, row: IParserRow, backtest: boolean) => {
+        const when = alignToInterval(row.publishedAt, "1m");
+        return await ExecutionContextService.runInContext(
+          async () => self.signalLogicService.execute(row),
+          { symbol: row.symbol, when, backtest },
+        );
+      },
+    );
+    ```
+
+    The observable pattern is intentionally simple: every cron tick fires one `next()` and the serialised job queue processes all pending rows before the next tick arrives.
+  </Step>
+
+  <Step title="Store result — screen-items written by ScreenDbService">
+    After `SignalLogicService.execute()` returns a complete `IScreenDto`, `SignalJobService` calls `ScreenDbService.create(dto)` to persist it in the **`screen-items`** MongoDB collection, then calls `ParserDbService.markVisited(row.id)` to flip `visited = true` on the originating parser row.
+
+    The `IScreenDto` carries every field from the parser item plus five new LLM-generated fields:
+
+    | Field | Type | Source |
+    |---|---|---|
+    | `riskAction` | `"skip" \| "follow"` | Ollama outline verdict |
+    | `riskSureLevel` | 5-value enum | Ollama audit field |
+    | `riskConfidence` | `"reliable" \| "not_reliable"` | Ollama audit field |
+    | `riskDescription` | `string` | 2-3 sentence human-readable verdict |
+    | `riskReasoning` | `string` | Step-by-step audit trail |
+
+    If a `screen-items` document for this `parserItemId` already exists (e.g. from a previous run), the row is skipped entirely — the LLM is never called twice for the same signal.
+  </Step>
+
+  <Step title="Strategy — getSignal reads screen-items and opens position">
+    `addStrategySchema` in `jan_2026.strategy.ts` registers a `getSignal` callback that `backtest-kit` calls on every price tick for each tracked symbol. The callback first queries `SignalMainService.getLast4HourSignal(symbol, when)` against `screen-items`. If the most recent signal is absent, or its `riskAction` is `"skip"`, the function returns `null` immediately — no position opens.
+
+    If `riskAction === "follow"`, the strategy checks whether the current market close price falls within `[signal.entryFrom, signal.entryTo]`. Only when price is inside the entry zone is a position returned with `priceTakeProfit = signal.targets[2]` and `priceStopLoss = signal.stoploss`.
+
+    ```typescript
+    // content/jan_2026.strategy/jan_2026.strategy.ts
+    getSignal: async (symbol, when, currentPrice) => {
+      const signal = await core.signalMainService.getLast4HourSignal(symbol, when);
+
+      if (!signal) return null;
+
+      if (signal.riskAction === "skip") return null;
+
+      const closePrice = await getClosePrice(symbol, "1m");
+      if (closePrice < signal.entryFrom || closePrice > signal.entryTo) {
+        return null;
+      }
+
+      return {
+        id: signal.id,
+        position: signal.direction,
+        priceStopLoss: signal.stoploss,
+        priceTakeProfit: signal.targets[2],
+        minuteEstimatedTime: Infinity,
+        note: JSON.stringify({
+          publishedAt: signal.publishedAt,
+          data: { direction: signal.direction, entryFrom: signal.entryFrom,
+                  entryTo: signal.entryTo, targets: signal.targets, stoploss: signal.stoploss },
+          risk: { action: signal.riskAction, sureLevel: signal.riskSureLevel,
+                  confidence: signal.riskConfidence, description: signal.riskDescription,
+                  reasoning: signal.riskReasoning },
+          parsed: signal.note,
+        }, null, 2),
+      };
+    },
+    ```
+  </Step>
+
+</Steps>
+
+## The signalJobSubject observable
+
+The hand-off between crawling and LLM processing uses a single-value `Subject<void>` from `functools-kit`, defined in `packages/core/src/config/emitters.ts`:
+
+```typescript
+// packages/core/src/config/emitters.ts
+import { Subject } from "functools-kit";
+
+export const signalJobSubject = new Subject<void>();
+```
+
+Both `CrawlerMainService.crawlLiveFrame()` and `CrawlerMainService.crawlBacktestFrame()` call `await signalJobSubject.next()` after completing a crawl pass. `SignalJobService.enable()` subscribes `this.run` (a `queued` async function) to this subject via `signalJobSubject.subscribe(this.run)`. The `queued` wrapper from `functools-kit` guarantees that overlapping emissions are serialised — if a 15-minute crawl fires `next()` while a previous LLM job is still running, the new job waits in a queue rather than spawning a concurrent run.
+
+<Note>
+  `signalJobSubject` carries no payload (`void`). The job runner always re-reads all unvisited rows from `parser-items` on each trigger, so it naturally picks up everything added since the last run.
+</Note>
+
+## Collection, service, and field map
+
+| Collection | Key fields | Written by | Read by |
+|---|---|---|---|
+| `parser-items` | `channel`, `messageId`, `symbol`, `direction`, `entry`, `targets`, `stoploss`, `visited` | `ParserDbService.create()` via `CrawlerService` | `SignalJobService` via `ParserDbService.findAllByVisited()` |
+| `screen-items` | `parserItemId`, `riskAction`, `riskSureLevel`, `riskConfidence`, `riskDescription`, `riskReasoning`, `entryFrom`, `entryTo` | `SignalJobService` via `ScreenDbService.create()` | `SignalMainService.getLast4HourSignal()` → strategy `getSignal` |

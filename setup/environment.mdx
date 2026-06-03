@@ -1,0 +1,138 @@
+---
+title: "Environment Variables for backtest-ollama-crontab"
+sidebarTitle: "Environment"
+description: "Configure MongoDB, Redis, Telegram MTProto, Ollama, and the symbol list via environment variables and .env files."
+---
+
+Every runtime behaviour of `backtest-ollama-crontab` is controlled through environment variables loaded from `.env` files at the root of each package. The monorepo ships two example files — `packages/core/.env.example` for the shared core library and a root-level `.env.example` that supplies Docker-friendly overrides — so you can get up and running by copying and editing rather than configuring from scratch.
+
+<Warning>
+  All files listed below contain real API credentials used as development
+  defaults. **Never commit a populated `.env` file to version control.** Both
+  `.env` and `session.txt` are already listed in `.gitignore`, but double-check
+  before pushing to a public repository.
+</Warning>
+
+## Package layout
+
+The monorepo splits configuration across two packages:
+
+| Package | File | Scope |
+|---|---|---|
+| `packages/core` | `packages/core/.env.example` | MongoDB, Redis, Telegram API, Ollama token |
+| `packages/main` | `packages/main/src/config/params.ts` | Symbol watchlist |
+
+Variables are read with `process.env` and fall back to hard-coded defaults defined in each package's `src/config/params.ts` file, so the application always boots even without a `.env` present.
+
+---
+
+## Core package variables
+
+These variables are declared in `packages/core/src/config/params.ts` and consumed by the crawler, Ollama client, Redis queue, and MongoDB persistence layer.
+
+<ParamField path="CC_MONGO_CONNECTION_STRING" type="string" default="mongodb://localhost:27017/backtest-pro?wtimeoutMS=15000">
+  Full MongoDB connection URI. The database name (`backtest-pro` by default) is
+  part of the URI. The `wtimeoutMS=15000` timeout prevents hung write operations
+  from blocking the crontab indefinitely. When running the application outside
+  Docker while MongoDB runs inside a container, replace `localhost` with
+  `host.docker.internal`.
+</ParamField>
+
+<ParamField path="CC_TELEGRAM_API_ID" type="number" default="31861455">
+  Numeric MTProto application ID obtained from
+  [my.telegram.org](https://my.telegram.org). The default value is a public
+  development credential included for convenience — replace it with your own
+  before going to production. Used by both the QR-code auth flow
+  (`packages/main/src/main/session.ts`) and the live `TelegramClient` singleton
+  in `getTelegram`.
+</ParamField>
+
+<ParamField path="CC_TELEGRAM_API_HASH" type="string" default="ca60446c67ce250ee4e789c730163449">
+  Alphanumeric MTProto application hash that pairs with `CC_TELEGRAM_API_ID`.
+  Obtain it from the same [my.telegram.org](https://my.telegram.org) dashboard.
+  Treat this value like a password.
+</ParamField>
+
+<ParamField path="CC_OLLAMA_TOKEN" type="string" default="">
+  Bearer token forwarded as the `Authorization` header when connecting to a
+  hosted Ollama instance. Leave empty (the default) when Ollama is running
+  locally without authentication. The `getOllama` singleton in
+  `packages/core/src/config/ollama.ts` always sets the header, so an empty
+  string simply sends `Authorization: Bearer ` which most local Ollama servers
+  ignore.
+</ParamField>
+
+<ParamField path="CC_REDIS_HOST" type="string" default="127.0.0.1">
+  Hostname or IP address of the Redis server. When the application runs on the
+  host machine and Redis runs inside Docker, set this to `host.docker.internal`.
+</ParamField>
+
+<ParamField path="CC_REDIS_PORT" type="number" default="6379">
+  TCP port that the Redis server listens on. Matches the default port exposed by
+  the bundled `docker/redis/docker-compose.yaml`.
+</ParamField>
+
+<ParamField path="CC_REDIS_USER" type="string" default="default">
+  Redis ACL username. The Docker Compose setup uses the built-in `default` user
+  with a password, so this value rarely needs to change unless you configure
+  custom ACL rules.
+</ParamField>
+
+<ParamField path="CC_REDIS_PASSWORD" type="string" default="mysecurepassword">
+  Password for the Redis ACL user defined by `CC_REDIS_USER`. Must match the
+  `--requirepass` argument passed to `redis-server` in
+  `docker/redis/docker-compose.yaml`. Change this before exposing Redis to any
+  network other than `localhost`.
+</ParamField>
+
+---
+
+## Main package variables
+
+The following variable is declared in `packages/main/src/config/params.ts` and controls which trading pairs the crawler and crontab fetch data for.
+
+<ParamField path="CC_SYMBOL_LIST" type="string" default="BTCUSDT,POLUSDT,ZECUSDT,HYPEUSDT,DOGEUSDT,SOLUSDT,PENGUUSDT,TRXUSDT,HBARUSDT,NEARUSDT,FARTCOINUSDT,ETHUSDT,PUMPUSDT">
+  Comma-separated list of Binance-style symbol strings. The value is split on
+  commas and each entry is trimmed of whitespace before use, so both
+  `BTCUSDT,ETHUSDT` and `BTCUSDT, ETHUSDT` are valid. Add or remove symbols to
+  narrow or broaden the set of signals the crawler processes on each 15-minute
+  tick.
+</ParamField>
+
+---
+
+## Example `.env` files
+
+<CodeGroup>
+
+```bash packages/core/.env.example
+CC_REDIS_HOST=127.0.0.1
+CC_MONGO_CONNECTION_STRING=mongodb://localhost:27017/backtest-kit?wtimeoutMS=15000
+CC_OLLAMA_TOKEN=
+```
+
+```bash .env.example (root — Docker overrides)
+CC_REDIS_HOST=host.docker.internal
+CC_MONGO_CONNECTION_STRING=mongodb://host.docker.internal:27017/backtest-kit?wtimeoutMS=15000
+```
+
+</CodeGroup>
+
+Copy the file that matches your setup and rename it to `.env` inside the appropriate directory:
+
+```bash
+# For the core package (local Ollama + local databases)
+cp packages/core/.env.example packages/core/.env
+
+# For Docker-hosted databases accessed from the host machine
+cp .env.example .env
+```
+
+<Note>
+  The root `.env.example` uses `host.docker.internal` instead of `127.0.0.1`
+  for both `CC_REDIS_HOST` and the MongoDB connection string. Use these values
+  whenever MongoDB and Redis are running inside Docker containers while the
+  Node.js process runs directly on your host machine. On Linux you may need to
+  add `--add-host=host.docker.internal:host-gateway` to your Docker run command
+  if `host.docker.internal` is not automatically resolved.
+</Note>

@@ -1,47 +1,144 @@
 ---
-title: "Quickstart"
-description: "Begin with a guide on the fastest path to a successful outcome"
+title: "Get Started with backtest-ollama-crontab in Four Steps"
+sidebarTitle: "Quickstart"
+description: "Build the workspace packages, authenticate Telegram via QR code, and run the January 2026 backtest in under 10 minutes."
 ---
 
-Describe how someone begins using your product. What is the first thing they need to do? Are there any prerequisites?
+Getting from a fresh clone to a completed backtest takes four terminal commands. The steps below follow the exact sequence in the README: build the workspace packages, authenticate your Telegram account via QR code, copy the resulting session file into the strategy folder, then launch the backtest engine against the January 2026 signal set. Before you begin, make sure MongoDB and Redis are reachable at their default ports and that Ollama is running locally with the `gpt-oss:120b` model pulled.
 
-A quickstart should take someone from zero to using your product. They'll get a quick win and a sense of what they can accomplish.
+<Note>
+  Ollama must be running on **`http://localhost:11434`** (the default) with the `gpt-oss:120b` model available. Pull it before running any step:
+  ```bash
+  ollama pull gpt-oss:120b
+  ```
+  The `CC_OLLAMA_URL` environment variable overrides the endpoint if you run Ollama on a different host or port.
+</Note>
 
-## Prerequisites
-
-Before you begin, you must have:
-
-- Requirement one (for example, Node.js 18+, a free account, an API key)
-- Requirement two (for example, a compatible device, a compatible browser, a compatible operating system)
-
-## Get started
+## Steps
 
 <Steps>
-  <Step title="Install">
-    Describe how to install your product or sign up.
+  <Step title="Build the workspace packages">
+    Run the build script from the repo root. The script (`scripts/linux/build.sh`) iterates every directory inside `packages/`, runs `npm install` and `npm run build` in each one. Rollup bundles each package to a self-contained `build/index.cjs` and rolls up a consolidated `types.d.ts` alongside it.
 
-    ```bash
-    npm install your-package
-    ```
+    <Tabs>
+      <Tab title="Linux / macOS">
+        ```bash
+        npm run build:x
+        ```
+      </Tab>
+      <Tab title="Windows">
+        ```bash
+        npm run build:win
+        ```
+      </Tab>
+    </Tabs>
+
+    After the build completes you should see `packages/core/build/index.cjs`, `packages/core/types.d.ts`, `packages/main/build/index.cjs`, and `packages/main/types.d.ts`.
+
+    <Tip>
+      The root `tsconfig.json` maps the `@pro/core` and `@pro/main` path aliases directly to these rolled-up `types.d.ts` files, so strategy files in `content/` get full IntelliSense without rebuilding:
+      ```json
+      {
+        "compilerOptions": {
+          "paths": {
+            "@pro/core": ["./packages/core/types.d.ts"],
+            "@pro/main": ["./packages/main/types.d.ts"]
+          }
+        }
+      }
+      ```
+    </Tip>
   </Step>
-  <Step title="Configure">
-    Describe any setup or configuration needed before first use.
+
+  <Step title="Authenticate the Telegram MTProto session">
+    The crawler uses GramJS (the `telegram` npm package) over the MTProto protocol to read messages from a public channel. You need to authenticate once and persist the session string to a file.
 
     ```bash
-    your-cli init
+    cd ./packages/main
+    npm run auth
     ```
+
+    A QR code is printed directly in your terminal. Open the Telegram mobile app, navigate to **Settings → Devices → Link Desktop Device**, and scan the code. If your account has two-factor authentication enabled, the CLI will prompt you for your 2FA password.
+
+    On success the client prints `Connected!` and writes the session string to:
+
+    ```
+    packages/main/session.txt
+    ```
+
+    <Warning>
+      `session.txt` is equivalent to a logged-in Telegram credential. **Never commit this file to version control.** The repo's `.gitignore` should already exclude it, but double-check before pushing.
+    </Warning>
   </Step>
-  <Step title="Run it">
-    Show the first thing a user does to see it working.
+
+  <Step title="Copy the session into the strategy folder">
+    The strategy file reads `session.txt` at runtime from its own directory so it can subscribe to the configured channel without triggering a new authentication flow. Copy the file you just created:
 
     ```bash
-    your-cli start
+    cp packages/main/session.txt content/jan_2026.strategy/session.txt
     ```
+
+    If you plan to run multiple strategy experiments in separate subdirectories of `content/`, copy the session file into each one.
+  </Step>
+
+  <Step title="Run the January 2026 backtest">
+    Return to the repo root and launch the `@backtest-kit/cli` runner, passing the strategy entry point and telling it to run in backtest mode. The `--cache` flag pre-fetches all required candles from the exchange before the replay begins — recommended for a first run so the replay doesn't stall waiting for network calls.
+
+    ```bash
+    npm start -- --backtest --ui --entry ./content/jan_2026.strategy/jan_2026.strategy.ts --cache
+    ```
+
+    The `--ui` flag opens the `backtest-kit` web dashboard in your browser so you can watch trades fill in real time. When the replay finishes you will see the full P&L summary including the Ollama-gated statistics: **+68.90% total PnL**, **82% winrate**, Sharpe **+0.512**.
   </Step>
 </Steps>
 
-<Tip>
-  Give people a way to get help. This could be a link to a support page, a chat with a customer support agent, or a forum for your product.
+---
 
-  Example: Need help? Reach out to us at [support@yourcompany.com](mailto:support@yourcompany.com).
+## CLI Flags Reference
+
+All flags are parsed by `packages/main/src/helpers/getArgs.ts` using Node's built-in `parseArgs`. Every flag is a boolean; unknown flags are silently ignored (`strict: false`).
+
+| Flag | Type | Description |
+|---|---|---|
+| `--backtest` | `boolean` | Run in backtest mode. Requires `--entry`. Uses `Backtest.background` from `backtest-kit`. |
+| `--live` | `boolean` | Run in live trading mode. Requires `--entry`. Uses `Live.background` from `backtest-kit`. |
+| `--paper` | `boolean` | Run in paper trading mode. Requires `--entry`. Executes strategy logic without placing real orders. |
+| `--session` | `boolean` | Auth session only — runs `packages/main/src/main/session.ts` to generate `session.txt`. No strategy is loaded. |
+| `--entry` | `boolean` | **Required for all modes except `--session`.** Signals that a strategy entry point has been passed as a positional argument (e.g. `--entry ./content/...`). |
+| `--cache` | `boolean` | Pre-cache candles for all symbols in `CC_SYMBOL_LIST` before the backtest begins. Fetches 1m candles from `frameSchema.startDate` to `frameSchema.endDate`. |
+
+<Tip>
+  Flags are read via `singleshot` from `functools-kit`, meaning `getArgs()` is memoized — the argument vector is parsed exactly once per process, no matter how many modules call `getArgs()`.
 </Tip>
+
+---
+
+## Environment Variables
+
+All configuration lives in a `.env` file at the repo root (loaded via `dotenv-cli` before any npm script). The defaults below are embedded directly in `packages/main/src/config/params.ts` and work out of the box for local development.
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `CC_MONGO_CONNECTION_STRING` | `mongodb://localhost:27017/backtest-pro?wtimeoutMS=15000` | MongoDB connection string for `parser-items` and `screen-items` collections |
+| `CC_TELEGRAM_API_ID` | `31861455` | Telegram MTProto API ID |
+| `CC_TELEGRAM_API_HASH` | `ca60446c67ce250ee4e789c730163449` | Telegram MTProto API hash |
+| `CC_SYMBOL_LIST` | `BTCUSDT,POLUSDT,ZECUSDT,HYPEUSDT,DOGEUSDT,SOLUSDT,PENGUUSDT,TRXUSDT,HBARUSDT,NEARUSDT,FARTCOINUSDT,ETHUSDT,PUMPUSDT,ENAUSDT` | Comma-separated symbols for candle caching and strategy iteration |
+| `CC_OLLAMA_URL` | `http://localhost:11434` | Ollama HTTP endpoint |
+
+---
+
+## What Happens Under the Hood
+
+When you run the backtest command, three things happen in sequence:
+
+<Accordion title="1. waitForReady — services initialise">
+  `backtest.ts` calls `waitForReady(true)` from `backtest-kit`. This blocks until the CLI has loaded the strategy file, resolved the exchange schema and frame schema, and confirmed that all registered services are ready. The `true` argument indicates that this is a backtest (not live) run, which affects how `getMode()` and `getContext()` behave throughout the strategy.
+</Accordion>
+
+<Accordion title="2. Optional candle cache — CC_SYMBOL_LIST × 1m">
+  If `--cache` is set, `backtest.ts` iterates `CC_SYMBOL_LIST` and calls `cacheCandles` for each symbol using the exchange name, frame start/end dates, and `interval: "1m"`. This populates the local candle store so the replay never has to make live HTTP calls during simulation.
+</Accordion>
+
+<Accordion title="3. Backtest.background — parallel symbol replay">
+  For every symbol in `CC_SYMBOL_LIST`, `Backtest.background(symbol, { exchangeName, strategyName, frameName })` is called. Each invocation runs independently, replaying candles and emitting trades as the strategy's cron handler fires on each 15-minute tick.
+</Accordion>

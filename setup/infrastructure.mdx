@@ -1,0 +1,162 @@
+---
+title: "Run MongoDB and Redis with Docker Compose"
+sidebarTitle: "Infrastructure"
+description: "Spin up the MongoDB 8.0 and Redis 7.4 containers required by backtest-ollama-crontab using the included Docker Compose files."
+---
+
+`backtest-ollama-crontab` requires two persistent services to be reachable before the crontab or backtest runner can start: a **MongoDB 8.0** instance that stores crawled parser items and screened signals, and a **Redis 7.4** instance used as the job queue between the crawler and the signal logic pipeline. Both are provided as single-service Docker Compose stacks under the `docker/` directory so you can bring them up with a single command per service.
+
+---
+
+## MongoDB
+
+The MongoDB stack is defined at `docker/mongodb/docker-compose.yaml` and runs the official MongoDB Community Server 8.0 image.
+
+```yaml docker/mongodb/docker-compose.yaml
+version: '3.8'
+services:
+  mongodb:
+    image: mongodb/mongodb-community-server:8.0.4-ubi8
+    container_name: mongodb
+    ports:
+      - '27017:27017'
+    volumes:
+      - ./mongo_data:/data/db
+    restart: always
+volumes:
+  mongo_data:
+```
+
+### Starting MongoDB
+
+```bash
+cd docker/mongodb
+docker compose up -d
+```
+
+Docker Compose will pull the image on first run and start the container in detached mode. The container is configured with `restart: always`, so it will come back automatically after a system reboot.
+
+### What gets created
+
+| Detail | Value |
+|---|---|
+| Container name | `mongodb` |
+| Exposed port | `27017` → `27017` |
+| Data volume | `./mongo_data` (relative to `docker/mongodb/`) |
+| Auth | None (unauthenticated, development only) |
+
+### Connecting via environment variable
+
+The `CC_MONGO_CONNECTION_STRING` environment variable in `packages/core` points to this instance:
+
+```bash
+CC_MONGO_CONNECTION_STRING=mongodb://localhost:27017/backtest-pro?wtimeoutMS=15000
+```
+
+The database `backtest-pro` is created automatically on first write. The `wtimeoutMS=15000` parameter ensures that a slow or unavailable MongoDB write does not hang the 15-minute crontab.
+
+---
+
+## Redis
+
+The Redis stack is defined at `docker/redis/docker-compose.yaml` and runs Redis 7.4 with password authentication enabled.
+
+```yaml docker/redis/docker-compose.yaml
+version: '3.8'
+
+services:
+  redis:
+    image: redis:7.4.1
+    container_name: redis
+    ports:
+      - "6379:6379"
+    environment:
+      - REDIS_PASSWORD=mysecurepassword
+    command: ["redis-server", "--requirepass", "mysecurepassword"]
+    volumes:
+      - ./redis_data:/data
+    restart: always
+
+volumes:
+  redis_data:
+```
+
+### Starting Redis
+
+```bash
+cd docker/redis
+docker compose up -d
+```
+
+### What gets created
+
+| Detail | Value |
+|---|---|
+| Container name | `redis` |
+| Exposed port | `6379` → `6379` |
+| Data volume | `./redis_data` (relative to `docker/redis/`) |
+| Password | `mysecurepassword` |
+| ACL user | `default` |
+
+### Connecting via environment variables
+
+The Redis connection in `packages/core` is assembled from four separate variables:
+
+```bash
+CC_REDIS_HOST=127.0.0.1
+CC_REDIS_PORT=6379
+CC_REDIS_USER=default
+CC_REDIS_PASSWORD=mysecurepassword
+```
+
+These defaults match the Docker Compose configuration exactly, so no changes are needed when running both the application and Redis on the same machine.
+
+---
+
+## Verifying both services
+
+Once both containers are running, confirm they are healthy:
+
+```bash
+# MongoDB — should print the server version
+docker exec mongodb mongosh --eval "db.version()"
+
+# Redis — should print PONG
+docker exec redis redis-cli -a mysecurepassword ping
+```
+
+---
+
+## Ollama
+
+Ollama does **not** have a Docker Compose file in this repository and must be installed and run separately. The risk-filter pipeline in `packages/core/src/logic/outline/risk.outline.ts` calls the `gpt-oss:120b` model for every parsed signal.
+
+<CardGroup cols={2}>
+  <Card title="Install Ollama" icon="download" href="https://ollama.com">
+    Follow the official Ollama installation guide for your operating system at
+    **ollama.com**.
+  </Card>
+  <Card title="Pull the required model" icon="robot">
+    After installing Ollama, pull the model used by the risk outline:
+
+    ```bash
+    ollama pull gpt-oss:120b
+    ```
+  </Card>
+</CardGroup>
+
+Once Ollama is running, the `getOllama` singleton in `packages/core/src/config/ollama.ts` will connect to it automatically. If you are using a hosted Ollama endpoint instead of a local one, set `CC_OLLAMA_TOKEN` to your Bearer token in `packages/core/.env`.
+
+<Tip>
+  When the Node.js application runs directly on your host machine but MongoDB
+  and Redis run inside Docker containers, replace `127.0.0.1` / `localhost` with
+  `host.docker.internal` in your `.env` files:
+
+  ```bash
+  CC_REDIS_HOST=host.docker.internal
+  CC_MONGO_CONNECTION_STRING=mongodb://host.docker.internal:27017/backtest-pro?wtimeoutMS=15000
+  ```
+
+  The root `.env.example` in the repository already contains these Docker-friendly
+  values — copy it to `.env` at the repo root to use them.
+</Tip>
